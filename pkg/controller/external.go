@@ -245,6 +245,9 @@ func (e *external) Observe(ctx context.Context, mg xpresource.Managed) (managed.
 	if err := json.JSParser.Unmarshal(res.State.GetAttributes(), &tfstate); err != nil {
 		return managed.ExternalObservation{}, errors.Wrap(err, "cannot unmarshal state attributes")
 	}
+	if err := resource.NormalizeStateID(tfstate); err != nil {
+		return managed.ExternalObservation{}, errors.Wrap(err, "cannot normalize state id")
+	}
 	if err := tr.SetObservation(tfstate); err != nil {
 		return managed.ExternalObservation{}, errors.Wrap(err, "cannot set observation")
 	}
@@ -493,6 +496,9 @@ func (e *external) Import(ctx context.Context, tr resource.Terraformed) (managed
 	tfstate := map[string]any{}
 	if err := json.JSParser.Unmarshal(res.State.GetAttributes(), &tfstate); err != nil {
 		return managed.ExternalObservation{}, errors.Wrap(err, "cannot unmarshal state attributes")
+	}
+	if err := resource.NormalizeStateID(tfstate); err != nil {
+		return managed.ExternalObservation{}, errors.Wrap(err, "cannot normalize state id")
 	}
 	if err := tr.SetObservation(tfstate); err != nil {
 		return managed.ExternalObservation{}, errors.Wrap(err, "cannot set observation")
