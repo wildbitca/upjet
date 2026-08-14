@@ -247,7 +247,10 @@ func (fp *FileProducer) EnsureTFState(_ context.Context, tfID string) error { //
 	// This is especially useful for resources whose deletion are scheduled for
 	// a long period of time, where if we fill the ID, the queries would actually
 	// succeed, i.e. GCP KMS KeyRing.
-	if !empty || meta.WasDeleted(fp.Resource) {
+	// Skip synthetic state creation when: state already exists, resource is
+	// being deleted, or there is no external identifier yet (new resource).
+	// Without an ID, Refresh would fail on providers that require it for Read.
+	if !empty || meta.WasDeleted(fp.Resource) || tfID == "" {
 		return nil
 	}
 	base := make(map[string]any)
@@ -340,11 +343,20 @@ func (fp *FileProducer) isStateEmpty() (bool, error) {
 	if !ok {
 		return true, nil
 	}
-	sid, ok := id.(string)
-	if !ok {
+	switch v := id.(type) {
+	case string:
+		return v == "", nil
+	case float64:
+		// Terraform's plugin-SDK always stores `id` as a string, but
+		// plugin-framework providers may declare it as a number and Terraform
+		// then writes it back into the state with that type (bunnynet, for
+		// instance, does so for 16 of its 24 resources). Zero is treated as
+		// the numeric counterpart of the empty string: no real resource is
+		// addressed by id 0, so the state is still considered empty.
+		return v == 0, nil
+	default:
 		return false, errors.Errorf(errFmtNonString, fmt.Sprint(id))
 	}
-	return sid == "", nil
 }
 
 type MainConfiguration struct {
