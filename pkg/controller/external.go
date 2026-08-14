@@ -245,6 +245,9 @@ func (e *external) Observe(ctx context.Context, mg xpresource.Managed) (managed.
 	if err := json.JSParser.Unmarshal(res.State.GetAttributes(), &tfstate); err != nil {
 		return managed.ExternalObservation{}, errors.Wrap(err, "cannot unmarshal state attributes")
 	}
+	if err := resource.NormalizeStateID(tfstate); err != nil {
+		return managed.ExternalObservation{}, errors.Wrap(err, "cannot normalize state id")
+	}
 
 	// NOTE(lsviben) although the annotations were supposed to be set and the
 	// managed resource updated during the Create step, we are checking and
@@ -513,7 +516,9 @@ func (e *external) Import(ctx context.Context, tr resource.Terraformed) (managed
 	if err := json.JSParser.Unmarshal(res.State.GetAttributes(), &tfstate); err != nil {
 		return managed.ExternalObservation{}, errors.Wrap(err, "cannot unmarshal state attributes")
 	}
-
+	if err := resource.NormalizeStateID(tfstate); err != nil {
+		return managed.ExternalObservation{}, errors.Wrap(err, "cannot normalize state id")
+	}
 	conn, err := resource.GetConnectionDetails(tfstate, tr, e.config)
 	if err != nil {
 		return managed.ExternalObservation{}, errors.Wrap(err, "cannot get connection details")
