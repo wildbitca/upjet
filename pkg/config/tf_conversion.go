@@ -87,7 +87,7 @@ func NewTFDynamicValueConversion() TerraformConversion {
 	return dynamicValueConversion{}
 }
 
-func (s dynamicValueConversion) Convert(params map[string]any, r *Resource, mode Mode) (map[string]any, error) {
+func (s dynamicValueConversion) Convert(params map[string]any, r *Resource, mode Mode) (map[string]any, error) { //nolint:gocyclo // both conversion directions are kept together, like inferTFTypeFromValue below
 	if mode == FromTerraform {
 		// Unwrap {type: ..., value: ...} envelopes back to bare values
 		// so that forProvider.value matches the bare format from the composition.
