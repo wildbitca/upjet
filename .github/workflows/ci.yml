@@ -83,8 +83,13 @@ jobs:
         uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
         with:
           path: .work/pkg
-          key: ${{ runner.os }}-pkg-${{ hashFiles('**/go.sum') }}
-          restore-keys: ${{ runner.os }}-pkg-
+          # Distinct key: check-diff/unit-tests below also cache a "*-pkg-*" key,
+          # but at a different path (`go-cache-paths.outputs.go-mod`, i.e.
+          # GOMODCACHE). Sharing the key name across two different paths meant
+          # whichever job saved last won, and the others restored the wrong
+          # content into their path.
+          key: ${{ runner.os }}-work-pkg-${{ hashFiles('**/go.sum') }}
+          restore-keys: ${{ runner.os }}-work-pkg-
 
       - name: Vendor Dependencies
         run: make vendor vendor.check
