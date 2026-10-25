@@ -30,7 +30,7 @@ env:
 
 jobs:
   detect-noop:
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(vars.CI_RUNNER || '"ubuntu-latest"') }}
     outputs:
       noop: ${{ steps.noop.outputs.should_skip }}
     steps:
@@ -44,7 +44,7 @@ jobs:
           concurrent_skipping: false
 
   lint:
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(vars.CI_RUNNER || '"ubuntu-latest"') }}
     needs: detect-noop
     if: needs.detect-noop.outputs.noop != 'true'
     steps:
@@ -103,7 +103,7 @@ jobs:
           version: ${{ env.GOLANGCI_VERSION }}
 
   check-diff:
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(vars.CI_RUNNER || '"ubuntu-latest"') }}
     needs: detect-noop
     if: needs.detect-noop.outputs.noop != 'true'
     steps:
@@ -150,7 +150,7 @@ jobs:
         run: make check-diff
 
   unit-tests:
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(vars.CI_RUNNER || '"ubuntu-latest"') }}
     needs: detect-noop
     if: needs.detect-noop.outputs.noop != 'true'
     steps:
