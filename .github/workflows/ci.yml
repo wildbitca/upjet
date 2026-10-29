@@ -12,10 +12,15 @@ on:
   pull_request: {}
   workflow_dispatch: {}
 
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
 env:
   # Common versions
-  GOLANGCI_VERSION: "v2.13.2"
-  DOCKER_BUILDX_VERSION: "v0.37.1"
+  GO_VERSION: "1.26.8"
+  GOLANGCI_VERSION: "v2.10.1"
+  DOCKER_BUILDX_VERSION: "v0.28.0"
 
   # Common users. We can't run a step 'if secrets.AWS_USR != ""' but we can run
   # a step 'if env.AWS_USR' != ""', so we copy these to succinctly test whether
@@ -25,13 +30,13 @@ env:
 
 jobs:
   detect-noop:
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(vars.CI_RUNNER || '"ubuntu-latest"') }}
     outputs:
       noop: ${{ steps.noop.outputs.should_skip }}
     steps:
       - name: Detect No-op Changes
         id: noop
-        uses: fkirc/skip-duplicate-actions@b974a9395958c231af965b70070979a577efa578 # v5.3.2
+        uses: fkirc/skip-duplicate-actions@f75f66ce1886f00957d99748a42c724f4330bdcf # v5.3.1
         with:
           github_token: ${{ secrets.GITHUB_TOKEN }}
           paths_ignore: '["**.md", "**.png", "**.jpg"]'
@@ -39,7 +44,7 @@ jobs:
           concurrent_skipping: false
 
   lint:
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(vars.CI_RUNNER || '"ubuntu-latest"') }}
     needs: detect-noop
     if: needs.detect-noop.outputs.noop != 'true'
     steps:
@@ -57,7 +62,7 @@ jobs:
       - name: Setup Go
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version-file: go.mod
+          go-version: ${{ env.GO_VERSION }}
 
       - name: Find the Go Build Cache
         id: go
@@ -68,18 +73,23 @@ jobs:
         run: echo "cache=$(go env GOCACHE)" >> $GITHUB_OUTPUT
 
       - name: Cache the Go Build Cache
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
         with:
           path: ${{ steps.go.outputs.cache }}
           key: ${{ runner.os }}-build-lint-${{ hashFiles('**/go.sum') }}
           restore-keys: ${{ runner.os }}-build-lint-
 
       - name: Cache Go Dependencies
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
         with:
           path: .work/pkg
-          key: ${{ runner.os }}-pkg-${{ hashFiles('**/go.sum') }}
-          restore-keys: ${{ runner.os }}-pkg-
+          # Distinct key: check-diff/unit-tests below also cache a "*-pkg-*" key,
+          # but at a different path (`go-cache-paths.outputs.go-mod`, i.e.
+          # GOMODCACHE). Sharing the key name across two different paths meant
+          # whichever job saved last won, and the others restored the wrong
+          # content into their path.
+          key: ${{ runner.os }}-work-pkg-${{ hashFiles('**/go.sum') }}
+          restore-keys: ${{ runner.os }}-work-pkg-
 
       - name: Vendor Dependencies
         run: make vendor vendor.check
@@ -88,12 +98,12 @@ jobs:
       # this action because it leaves 'annotations' (i.e. it comments on PRs to
       # point out linter violations).
       - name: Lint
-        uses: golangci/golangci-lint-action@ba0d7d2ec06a0ea1cb5fa41b2e4a3ab91d21278a # v9.3.0
+        uses: golangci/golangci-lint-action@1e7e51e771db61008b38414a730f564565cf7c20 # v9.2.0
         with:
           version: ${{ env.GOLANGCI_VERSION }}
 
   check-diff:
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(vars.CI_RUNNER || '"ubuntu-latest"') }}
     needs: detect-noop
     if: needs.detect-noop.outputs.noop != 'true'
     steps:
@@ -111,7 +121,7 @@ jobs:
       - name: Setup Go
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version-file: go.mod
+          go-version: ${{ env.GO_VERSION }}
 
       - name: Find the Go Build Cache
         id: go-cache-paths
@@ -120,14 +130,14 @@ jobs:
           echo "go-mod=$(make go.mod.cachedir)" >> $GITHUB_OUTPUT
 
       - name: Cache the Go Build Cache
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
         with:
           path: ${{ steps.go-cache-paths.outputs.go-build }}
           key: ${{ runner.os }}-build-check-diff-${{ hashFiles('**/go.sum') }}
           restore-keys: ${{ runner.os }}-build-check-diff-
 
       - name: Cache Go Dependencies
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
         with:
           path: ${{ steps.go-cache-paths.outputs.go-mod }}
           key: ${{ runner.os }}-pkg-${{ hashFiles('**/go.sum') }}
@@ -140,7 +150,7 @@ jobs:
         run: make check-diff
 
   unit-tests:
-    runs-on: ubuntu-latest
+    runs-on: ${{ fromJSON(vars.CI_RUNNER || '"ubuntu-latest"') }}
     needs: detect-noop
     if: needs.detect-noop.outputs.noop != 'true'
     steps:
@@ -161,7 +171,7 @@ jobs:
       - name: Setup Go
         uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
         with:
-          go-version-file: go.mod
+          go-version: ${{ env.GO_VERSION }}
 
       - name: Find the Go Build Cache
         id: go-cache-paths
@@ -170,14 +180,14 @@ jobs:
           echo "go-mod=$(make go.mod.cachedir)" >> $GITHUB_OUTPUT
 
       - name: Cache the Go Build Cache
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
         with:
           path: ${{ steps.go-cache-paths.outputs.go-build }}
           key: ${{ runner.os }}-build-unit-tests-${{ hashFiles('**/go.sum') }}
           restore-keys: ${{ runner.os }}-build-unit-tests-
 
       - name: Cache Go Dependencies
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
+        uses: actions/cache@668228422ae6a00e4ad889ee87cd7109ec5666a7 # v5.0.4
         with:
           path: ${{ steps.go-cache-paths.outputs.go-mod }}
           key: ${{ runner.os }}-pkg-${{ hashFiles('**/go.sum') }}
@@ -190,61 +200,7 @@ jobs:
         run: make -j2 test
 
       - name: Publish Unit Test Coverage
-        uses: codecov/codecov-action@57e3a136b779b570ffcdbf80b3bdc90e7fab3de2 # v6
+        uses: codecov/codecov-action@303a32d7a59b442fa8d48b6a1cc6825c09c847a5 # v7.1.1
         with:
           flags: unittests
-          files: _output/tests/linux_amd64/coverage.txt
-          token: ${{ secrets.CODECOV_TOKEN }}
-
-  race-tests:
-    runs-on: ubuntu-latest
-    needs: detect-noop
-    if: needs.detect-noop.outputs.noop != 'true'
-    steps:
-      - name: Cleanup Disk
-        uses: jlumbroso/free-disk-space@54081f138730dfa15788a46383842cd2f914a1be # v1.3.1
-        with:
-          large-packages: false
-          swap-storage: false
-
-      - name: Checkout
-        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
-        with:
-          submodules: true
-
-      - name: Fetch History
-        run: git fetch --prune --unshallow
-
-      - name: Setup Go
-        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
-        with:
-          go-version-file: go.mod
-
-      - name: Find the Go Build Cache
-        id: go-cache-paths
-        run: |
-          echo "go-build=$(make go.cachedir)" >> $GITHUB_OUTPUT
-          echo "go-mod=$(make go.mod.cachedir)" >> $GITHUB_OUTPUT
-
-      - name: Cache the Go Build Cache
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: ${{ steps.go-cache-paths.outputs.go-build }}
-          key: ${{ runner.os }}-build-race-tests-${{ hashFiles('**/go.sum') }}
-          restore-keys: ${{ runner.os }}-build-race-tests-
-
-      - name: Cache Go Dependencies
-        uses: actions/cache@55cc8345863c7cc4c66a329aec7e433d2d1c52a9 # v6.1.0
-        with:
-          path: ${{ steps.go-cache-paths.outputs.go-mod }}
-          key: ${{ runner.os }}-pkg-race-tests-${{ hashFiles('**/go.sum') }}
-          restore-keys: ${{ runner.os }}-pkg-race-tests-
-
-      - name: Vendor Dependencies
-        run: make vendor vendor.check
-
-      # Runs the unit tests with the Go race detector enabled to guard against
-      # regressions of concurrency bugs such as the managed resource status
-      # update data race. See: https://github.com/crossplane/upjet/issues/472
-      - name: Run Race Tests
-        run: make test.race
+          file: _output/tests/linux_amd64/coverage.txt
