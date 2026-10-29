@@ -113,8 +113,19 @@ type testConfiguration struct {
 	applyErr   error
 	applyDiags []*tfprotov6.Diagnostic
 
-	planErr   error
-	planDiags []*tfprotov6.Diagnostic
+	planErr             error
+	planDiags           []*tfprotov6.Diagnostic
+	planRequiresReplace []*tftypes.AttributePath
+
+	// Identity fields for response mocking
+	readNewIdentity     *tfprotov6.ResourceIdentityData
+	planPlannedIdentity *tfprotov6.ResourceIdentityData
+	applyNewIdentity    *tfprotov6.ResourceIdentityData
+
+	// Capture fields for verifying identity in requests
+	capturedReadRequest  **tfprotov6.ReadResourceRequest
+	capturedPlanRequest  **tfprotov6.PlanResourceChangeRequest
+	capturedApplyRequest **tfprotov6.ApplyResourceChangeRequest
 }
 
 func prepareTPFExternalWithTestConfig(testConfig testConfiguration) *terraformPluginFrameworkExternalClient {
@@ -139,27 +150,40 @@ func prepareTPFExternalWithTestConfig(testConfig testConfiguration) *terraformPl
 		ts: terraform.Setup{
 			FrameworkProvider: &mockTPFProvider{},
 		},
-		config: cfg,
+		config: testConfig.cfg,
 		logger: logTest,
 		// metricRecorder:             nil,
 		opTracker: NewAsyncTracker(),
 		resource:  testConfig.r,
 		server: &mockTPFProviderServer{
 			ReadResourceFn: func(ctx context.Context, request *tfprotov6.ReadResourceRequest) (*tfprotov6.ReadResourceResponse, error) {
+				if testConfig.capturedReadRequest != nil {
+					*testConfig.capturedReadRequest = request
+				}
 				return &tfprotov6.ReadResourceResponse{
 					NewState:    currentStateVal,
+					NewIdentity: testConfig.readNewIdentity,
 					Diagnostics: testConfig.readDiags,
 				}, testConfig.readErr
 			},
 			PlanResourceChangeFn: func(ctx context.Context, request *tfprotov6.PlanResourceChangeRequest) (*tfprotov6.PlanResourceChangeResponse, error) {
+				if testConfig.capturedPlanRequest != nil {
+					*testConfig.capturedPlanRequest = request
+				}
 				return &tfprotov6.PlanResourceChangeResponse{
-					PlannedState: plannedStateVal,
-					Diagnostics:  testConfig.planDiags,
+					PlannedState:    plannedStateVal,
+					PlannedIdentity: testConfig.planPlannedIdentity,
+					RequiresReplace: testConfig.planRequiresReplace,
+					Diagnostics:     testConfig.planDiags,
 				}, testConfig.planErr
 			},
 			ApplyResourceChangeFn: func(ctx context.Context, request *tfprotov6.ApplyResourceChangeRequest) (*tfprotov6.ApplyResourceChangeResponse, error) {
+				if testConfig.capturedApplyRequest != nil {
+					*testConfig.capturedApplyRequest = request
+				}
 				return &tfprotov6.ApplyResourceChangeResponse{
 					NewState:    newStateAfterApplyVal,
+					NewIdentity: testConfig.applyNewIdentity,
 					Diagnostics: testConfig.applyDiags,
 				}, testConfig.applyErr
 			},
@@ -510,6 +534,520 @@ func TestTPFDelete(t *testing.T) {
 	}
 }
 
+// newTestIdentityData creates a *tfprotov6.ResourceIdentityData for testing.
+func newTestIdentityData(id string) *tfprotov6.ResourceIdentityData {
+	identityType := tftypes.Object{
+		AttributeTypes: map[string]tftypes.Type{
+			"id": tftypes.String,
+		},
+	}
+	identityVal := tftypes.NewValue(identityType, map[string]tftypes.Value{
+		"id": tftypes.NewValue(tftypes.String, id),
+	})
+	dv, err := tfprotov6.NewDynamicValue(identityType, identityVal)
+	if err != nil {
+		panic("cannot create test identity data: " + err.Error())
+	}
+	return &tfprotov6.ResourceIdentityData{
+		IdentityData: &dv,
+	}
+}
+
+func TestTPFObserveIdentityPropagation(t *testing.T) {
+	t.Run("ObservePassesCurrentIdentityAndStoresNewIdentity", func(t *testing.T) {
+		existingIdentity := newTestIdentityData("existing-id")
+		newIdentity := newTestIdentityData("refreshed-id")
+
+		var capturedReadReq *tfprotov6.ReadResourceRequest
+		tc := testConfiguration{
+			r:   newMockTPFResourceWithIdentity(),
+			cfg: newBaseUpjetConfig(),
+			obj: newBaseObject(),
+			params: map[string]any{
+				"id":   "example-id",
+				"name": "example",
+			},
+			currentStateMap: map[string]any{
+				"id":   "example-id",
+				"name": "example",
+			},
+			plannedStateMap: map[string]any{
+				"id":   "example-id",
+				"name": "example",
+			},
+			readNewIdentity:     newIdentity,
+			capturedReadRequest: &capturedReadReq,
+		}
+		tpfExternal := prepareTPFExternalWithTestConfig(tc)
+		// Pre-set identity on the tracker to verify it's passed in the request
+		tpfExternal.opTracker.SetFrameworkIdentity(existingIdentity)
+
+		_, err := tpfExternal.Observe(context.TODO(), &tc.obj)
+		if err != nil {
+			t.Fatalf("Observe returned unexpected error: %v", err)
+		}
+		// Verify CurrentIdentity was passed in the read request
+		if capturedReadReq == nil {
+			t.Fatal("ReadResource was not called")
+		}
+		if capturedReadReq.CurrentIdentity != existingIdentity {
+			t.Error("ReadResourceRequest.CurrentIdentity was not set to the tracker's identity")
+		}
+		// Verify NewIdentity from response was stored in the tracker
+		storedIdentity := tpfExternal.opTracker.GetFrameworkIdentity()
+		if storedIdentity != newIdentity {
+			t.Error("NewIdentity from ReadResourceResponse was not stored in the tracker")
+		}
+	})
+
+	t.Run("ObserveHandlesNilIdentity", func(t *testing.T) {
+		var capturedReadReq *tfprotov6.ReadResourceRequest
+		tc := testConfiguration{
+			r:   newMockTPFResourceWithIdentity(),
+			cfg: newBaseUpjetConfig(),
+			obj: newBaseObject(),
+			params: map[string]any{
+				"id":   "example-id",
+				"name": "example",
+			},
+			currentStateMap: map[string]any{
+				"id":   "example-id",
+				"name": "example",
+			},
+			plannedStateMap: map[string]any{
+				"id":   "example-id",
+				"name": "example",
+			},
+			readNewIdentity:     nil,
+			capturedReadRequest: &capturedReadReq,
+		}
+		tpfExternal := prepareTPFExternalWithTestConfig(tc)
+
+		_, err := tpfExternal.Observe(context.TODO(), &tc.obj)
+		if err != nil {
+			t.Fatalf("Observe returned unexpected error: %v", err)
+		}
+		// With no pre-set identity, request should have nil CurrentIdentity
+		if capturedReadReq.CurrentIdentity != nil {
+			t.Error("ReadResourceRequest.CurrentIdentity should be nil when tracker has no identity")
+		}
+		// With nil identity in response, tracker should store nil
+		if tpfExternal.opTracker.GetFrameworkIdentity() != nil {
+			t.Error("Tracker identity should be nil when response has no identity")
+		}
+	})
+
+	t.Run("ObserveClearsIdentityWhenResourceNotFound", func(t *testing.T) {
+		// Regression test for the placeholder-identifier case: on the initial
+		// Observe the resource does not exist (nil state), but the provider may
+		// still return a non-empty identity carrying the placeholder id.
+		// Persisting it caused subsequent reconciles to detect a superfluous
+		// identity change and fail the read. The identity must be discarded for
+		// not-found observations.
+		placeholderIdentity := newTestIdentityData("placeholder-id")
+
+		tc := testConfiguration{
+			r:               newMockTPFResourceWithIdentity(),
+			cfg:             newBaseUpjetConfig(),
+			obj:             obj,
+			currentStateMap: nil,
+			plannedStateMap: map[string]any{
+				"name": "example",
+			},
+			params: map[string]any{
+				"name": "example",
+			},
+			// provider returns an identity even though the resource is absent
+			readNewIdentity: placeholderIdentity,
+		}
+		tpfExternal := prepareTPFExternalWithTestConfig(tc)
+		// Pre-set a stale identity on the tracker as well.
+		tpfExternal.opTracker.SetFrameworkIdentity(placeholderIdentity)
+
+		obs, err := tpfExternal.Observe(context.TODO(), &tc.obj)
+		if err != nil {
+			t.Fatalf("Observe returned unexpected error: %v", err)
+		}
+		if obs.ResourceExists {
+			t.Fatal("resource should not exist for this observation")
+		}
+		if tpfExternal.opTracker.GetFrameworkIdentity() != nil {
+			t.Error("tracker identity should be cleared when the resource is not found")
+		}
+	})
+}
+
+func TestTPFCreateIdentityPropagation(t *testing.T) {
+	t.Run("CreatePassesPlannedIdentityAndStoresNewIdentity", func(t *testing.T) {
+		plannedIdentity := newTestIdentityData("planned-id")
+		newIdentity := newTestIdentityData("created-id")
+
+		var capturedApplyReq *tfprotov6.ApplyResourceChangeRequest
+		tc := testConfiguration{
+			r:               newMockTPFResourceWithIdentity(),
+			cfg:             newBaseUpjetConfig(),
+			obj:             obj,
+			currentStateMap: nil,
+			plannedStateMap: map[string]any{
+				"name": "example",
+			},
+			params: map[string]any{
+				"name": "example",
+			},
+			newStateMap: map[string]any{
+				"name": "example",
+				"id":   "example-id",
+			},
+			planPlannedIdentity:  plannedIdentity,
+			applyNewIdentity:     newIdentity,
+			capturedApplyRequest: &capturedApplyReq,
+		}
+		tpfExternal := prepareTPFExternalWithTestConfig(tc)
+		// Pre-set plannedIdentity as it would be after a Plan call
+		tpfExternal.plannedIdentity = plannedIdentity
+
+		_, err := tpfExternal.Create(context.TODO(), &tc.obj)
+		if err != nil {
+			t.Fatalf("Create returned unexpected error: %v", err)
+		}
+		if capturedApplyReq == nil {
+			t.Fatal("ApplyResourceChange was not called")
+		}
+		if capturedApplyReq.PlannedIdentity != plannedIdentity {
+			t.Error("ApplyResourceChangeRequest.PlannedIdentity was not set to the planned identity")
+		}
+		storedIdentity := tpfExternal.opTracker.GetFrameworkIdentity()
+		if storedIdentity != newIdentity {
+			t.Error("NewIdentity from ApplyResourceChangeResponse was not stored in the tracker")
+		}
+	})
+
+	t.Run("CreateDoesNotStoreIdentityOnDiagError", func(t *testing.T) {
+		// Regression test for
+		// https://github.com/crossplane-contrib/provider-upjet-aws/issues/2135
+		// On a partial-create error, the returned TF identity might be
+		// partial/garbage. Storing it caused a subsequent Observe (which
+		// recovers a valid identity from state) to detect a superfluous
+		// garbage->valid identity change and fail. The identity must NOT be
+		// stored here; it is rehydrated from state on later reconciles.
+		partialIdentity := newTestIdentityData("partial-id")
+
+		tc := testConfiguration{
+			r:               newMockTPFResourceWithIdentity(),
+			cfg:             newBaseUpjetConfig(),
+			obj:             obj,
+			currentStateMap: nil,
+			plannedStateMap: map[string]any{
+				"name": "example",
+			},
+			params: map[string]any{
+				"name": "example",
+			},
+			newStateMap: nil,
+			applyDiags: []*tfprotov6.Diagnostic{
+				{
+					Severity: tfprotov6.DiagnosticSeverityError,
+					Summary:  "partial failure",
+					Detail:   "resource partially created",
+				},
+			},
+			applyNewIdentity: partialIdentity,
+		}
+		tpfExternal := prepareTPFExternalWithTestConfig(tc)
+
+		_, err := tpfExternal.Create(context.TODO(), &tc.obj)
+		if err == nil {
+			t.Fatal("Create should have returned an error on diag error")
+		}
+		// Identity must NOT be stored on the error path.
+		if storedIdentity := tpfExternal.opTracker.GetFrameworkIdentity(); storedIdentity != nil {
+			t.Error("NewIdentity should not be stored in tracker when apply returns error diags")
+		}
+		// The (partial) state, however, is still preserved so the external
+		// resource can be tracked on subsequent reconciles.
+		if !tpfExternal.opTracker.HasFrameworkTFState() {
+			t.Error("partial framework state should be preserved when apply returns error diags")
+		}
+	})
+}
+
+func TestTPFUpdateIdentityPropagation(t *testing.T) {
+	t.Run("UpdatePassesPlannedIdentityAndStoresNewIdentity", func(t *testing.T) {
+		plannedIdentity := newTestIdentityData("planned-id")
+		newIdentity := newTestIdentityData("updated-id")
+
+		var capturedApplyReq *tfprotov6.ApplyResourceChangeRequest
+		tc := testConfiguration{
+			r:   newMockTPFResourceWithIdentity(),
+			cfg: newBaseUpjetConfig(),
+			obj: newBaseObject(),
+			currentStateMap: map[string]any{
+				"name": "example",
+				"id":   "example-id",
+			},
+			plannedStateMap: map[string]any{
+				"name": "example-updated",
+				"id":   "example-id",
+			},
+			params: map[string]any{
+				"name": "example-updated",
+			},
+			newStateMap: map[string]any{
+				"name": "example-updated",
+				"id":   "example-id",
+			},
+			planPlannedIdentity:  plannedIdentity,
+			applyNewIdentity:     newIdentity,
+			capturedApplyRequest: &capturedApplyReq,
+		}
+		tpfExternal := prepareTPFExternalWithTestConfig(tc)
+		// Pre-set plannedIdentity as it would be after a Plan call
+		tpfExternal.plannedIdentity = plannedIdentity
+
+		_, err := tpfExternal.Update(context.TODO(), &tc.obj)
+		if err != nil {
+			t.Fatalf("Update returned unexpected error: %v", err)
+		}
+		if capturedApplyReq == nil {
+			t.Fatal("ApplyResourceChange was not called")
+		}
+		if capturedApplyReq.PlannedIdentity != plannedIdentity {
+			t.Error("ApplyResourceChangeRequest.PlannedIdentity was not set to the planned identity")
+		}
+		storedIdentity := tpfExternal.opTracker.GetFrameworkIdentity()
+		if storedIdentity != newIdentity {
+			t.Error("NewIdentity from ApplyResourceChangeResponse was not stored in the tracker")
+		}
+	})
+}
+
+func TestTPFDeleteIdentityPropagation(t *testing.T) {
+	t.Run("DeleteSendsNilPlannedIdentityAndStoresNewIdentity", func(t *testing.T) {
+		plannedIdentity := newTestIdentityData("planned-id")
+
+		var capturedApplyReq *tfprotov6.ApplyResourceChangeRequest
+		tc := testConfiguration{
+			r:   newMockTPFResourceWithIdentity(),
+			cfg: newBaseUpjetConfig(),
+			obj: newBaseObject(),
+			currentStateMap: map[string]any{
+				"name": "example",
+				"id":   "example-id",
+			},
+			plannedStateMap: nil,
+			params: map[string]any{
+				"name": "example",
+			},
+			newStateMap:          nil,
+			applyNewIdentity:     nil,
+			capturedApplyRequest: &capturedApplyReq,
+		}
+		tpfExternal := prepareTPFExternalWithTestConfig(tc)
+		// Pre-set plannedIdentity to simulate state after a prior Observe/Plan
+		// call. Delete should NOT forward this stale update-plan identity.
+		tpfExternal.plannedIdentity = plannedIdentity
+
+		_, err := tpfExternal.Delete(context.TODO(), &tc.obj)
+		if err != nil {
+			t.Fatalf("Delete returned unexpected error: %v", err)
+		}
+		if capturedApplyReq == nil {
+			t.Fatal("ApplyResourceChange was not called")
+		}
+		// PlannedIdentity must be nil for delete: the planned state is null
+		// (resource is going away) so there is no meaningful planned identity.
+		if capturedApplyReq.PlannedIdentity != nil {
+			t.Error("ApplyResourceChangeRequest.PlannedIdentity should be nil for delete operations")
+		}
+		// After delete, identity from response (nil) should be stored
+		storedIdentity := tpfExternal.opTracker.GetFrameworkIdentity()
+		if storedIdentity != nil {
+			t.Error("Tracker identity should be nil after delete with nil response identity")
+		}
+	})
+}
+
+func TestHasMissingResourceIdentityDiagnostic(t *testing.T) {
+	cases := map[string]struct {
+		diags []*tfprotov6.Diagnostic
+		want  bool
+	}{
+		"NilDiags": {
+			diags: nil,
+			want:  false,
+		},
+		"EmptyDiags": {
+			diags: []*tfprotov6.Diagnostic{},
+			want:  false,
+		},
+		"UnrelatedError": {
+			diags: []*tfprotov6.Diagnostic{
+				{Severity: tfprotov6.DiagnosticSeverityError, Summary: "Some other error"},
+			},
+			want: false,
+		},
+		"WarningNotError": {
+			diags: []*tfprotov6.Diagnostic{
+				{Severity: tfprotov6.DiagnosticSeverityWarning, Summary: diagSummaryMissingResourceIdentity},
+			},
+			want: false,
+		},
+		"MatchingDiagnostic": {
+			diags: []*tfprotov6.Diagnostic{
+				{Severity: tfprotov6.DiagnosticSeverityError, Summary: diagSummaryMissingResourceIdentity},
+			},
+			want: true,
+		},
+		"MatchingAmongMultiple": {
+			diags: []*tfprotov6.Diagnostic{
+				{Severity: tfprotov6.DiagnosticSeverityWarning, Summary: "some warning"},
+				{Severity: tfprotov6.DiagnosticSeverityError, Summary: diagSummaryMissingResourceIdentity},
+			},
+			want: true,
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			got := hasMissingResourceIdentityDiagnostic(tc.diags)
+			if got != tc.want {
+				t.Errorf("hasMissingResourceIdentityDiagnostic() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+func TestTPFObserveMissingIdentityTreatedAsNotFound(t *testing.T) {
+	tc := testConfiguration{
+		r:   newMockTPFResourceWithIdentity(),
+		cfg: newBaseUpjetConfig(),
+		obj: newBaseObject(),
+		params: map[string]any{
+			"name": "example",
+		},
+		currentStateMap: map[string]any{
+			"id":   "example-id",
+			"name": "example",
+		},
+		plannedStateMap: map[string]any{
+			"name": "example",
+		},
+		readDiags: []*tfprotov6.Diagnostic{
+			{Severity: tfprotov6.DiagnosticSeverityError, Summary: diagSummaryMissingResourceIdentity},
+		},
+	}
+
+	tpfExternal := prepareTPFExternalWithTestConfig(tc)
+	obs, err := tpfExternal.Observe(context.TODO(), &tc.obj)
+	if err != nil {
+		t.Fatalf("Observe returned unexpected error: %v", err)
+	}
+	if obs.ResourceExists {
+		t.Error("Expected ResourceExists to be false when Missing Resource Identity diagnostic is returned")
+	}
+	storedIdentity := tpfExternal.opTracker.GetFrameworkIdentity()
+	if storedIdentity != nil {
+		t.Error("Expected tracker identity to be nil after Missing Resource Identity diagnostic")
+	}
+}
+
+// TestTPFPlanIdentityPropagation tests identity propagation through
+// getDiffPlanResponse, which is unexported and invoked internally by Observe.
+func TestTPFPlanIdentityPropagation(t *testing.T) {
+	t.Run("ObserveRehydratesIdentityBeforePlan", func(t *testing.T) {
+		refreshedIdentity := newTestIdentityData("refreshed-id")
+		plannedIdentity := newTestIdentityData("planned-id")
+
+		var capturedReadReq *tfprotov6.ReadResourceRequest
+		var capturedPlanReq *tfprotov6.PlanResourceChangeRequest
+		tc := testConfiguration{
+			r:   newMockTPFResourceWithIdentity(),
+			cfg: newBaseUpjetConfig(),
+			obj: newBaseObject(),
+			params: map[string]any{
+				"id":   "example-id",
+				"name": "example",
+			},
+			currentStateMap: map[string]any{
+				"id":   "example-id",
+				"name": "example",
+			},
+			plannedStateMap: map[string]any{
+				"id":   "example-id",
+				"name": "example",
+			},
+			readNewIdentity:     refreshedIdentity,
+			planPlannedIdentity: plannedIdentity,
+			capturedReadRequest: &capturedReadReq,
+			capturedPlanRequest: &capturedPlanReq,
+		}
+
+		tpfExternal := prepareTPFExternalWithTestConfig(tc)
+		// Do NOT pre-set identity on the tracker — simulates a restart
+		_, err := tpfExternal.Observe(context.TODO(), &tc.obj)
+		if err != nil {
+			t.Fatalf("Observe returned unexpected error: %v", err)
+		}
+		if capturedReadReq == nil {
+			t.Fatal("ReadResource was not called")
+		}
+		if capturedReadReq.CurrentIdentity != nil {
+			t.Fatal("ReadResourceRequest.CurrentIdentity should be nil during rehydration")
+		}
+		if capturedPlanReq == nil {
+			t.Fatal("PlanResourceChange was not called")
+		}
+		if diff := cmp.Diff(refreshedIdentity, capturedPlanReq.PriorIdentity); diff != "" {
+			t.Fatalf("PlanResourceChangeRequest.PriorIdentity mismatch (-want +got):\n%s", diff)
+		}
+	})
+
+	t.Run("PlanPassesPriorIdentityAndCapturesPlannedIdentity", func(t *testing.T) {
+		existingIdentity := newTestIdentityData("existing-id")
+		plannedIdentity := newTestIdentityData("planned-id")
+
+		var capturedPlanReq *tfprotov6.PlanResourceChangeRequest
+		tc := testConfiguration{
+			r:   newMockTPFResourceWithIdentity(),
+			cfg: newBaseUpjetConfig(),
+			obj: newBaseObject(),
+			params: map[string]any{
+				"id":   "example-id",
+				"name": "example",
+			},
+			currentStateMap: map[string]any{
+				"id":   "example-id",
+				"name": "example",
+			},
+			plannedStateMap: map[string]any{
+				"id":   "example-id",
+				"name": "example",
+			},
+			readNewIdentity:     existingIdentity,
+			planPlannedIdentity: plannedIdentity,
+			capturedPlanRequest: &capturedPlanReq,
+		}
+		tpfExternal := prepareTPFExternalWithTestConfig(tc)
+		// Pre-set identity on the tracker to verify it's passed as PriorIdentity
+		tpfExternal.opTracker.SetFrameworkIdentity(existingIdentity)
+
+		// Observe triggers getDiffPlanResponse internally
+		_, err := tpfExternal.Observe(context.TODO(), &tc.obj)
+		if err != nil {
+			t.Fatalf("Observe returned unexpected error: %v", err)
+		}
+		if capturedPlanReq == nil {
+			t.Fatal("PlanResourceChange was not called")
+		}
+		if capturedPlanReq.PriorIdentity != existingIdentity {
+			t.Error("PlanResourceChangeRequest.PriorIdentity was not set to the tracker's identity")
+		}
+		// Verify planned identity was captured on the client
+		if tpfExternal.plannedIdentity != plannedIdentity {
+			t.Error("PlannedIdentity from PlanResourceChangeResponse was not stored on the client")
+		}
+	})
+}
+
 // Mocks
 
 var _ resource.Resource = &mockTPFResource{}
@@ -758,4 +1296,735 @@ func (r *mockTPFResource) Update(ctx context.Context, req resource.UpdateRequest
 	}
 
 	r.UpdateMethod(ctx, req, resp)
+}
+
+// mockTPFResourceWithIdentity extends mockTPFResource by also implementing
+// resource.ResourceWithIdentity, so supportsIdentity() returns true.
+type mockTPFResourceWithIdentity struct {
+	mockTPFResource
+}
+
+var _ resource.ResourceWithIdentity = &mockTPFResourceWithIdentity{}
+
+func (r *mockTPFResourceWithIdentity) IdentitySchema(_ context.Context, _ resource.IdentitySchemaRequest, _ *resource.IdentitySchemaResponse) {
+}
+
+func newMockTPFResourceWithIdentity() *mockTPFResourceWithIdentity {
+	return &mockTPFResourceWithIdentity{
+		mockTPFResource: mockTPFResource{
+			SchemaMethod: func(ctx context.Context, request resource.SchemaRequest, response *resource.SchemaResponse) {
+				response.Schema = newBaseSchema()
+			},
+			ReadMethod: func(ctx context.Context, request resource.ReadRequest, response *resource.ReadResponse) {
+				response.State = tfsdk.State{
+					Raw:    tftypes.Value{},
+					Schema: nil,
+				}
+			},
+		},
+	}
+}
+
+func TestFilteredDiffExists(t *testing.T) {
+	strVal := func(s string) *tftypes.Value {
+		v := tftypes.NewValue(tftypes.String, s)
+		return &v
+	}
+	nullVal := func() *tftypes.Value {
+		v := tftypes.NewValue(tftypes.String, nil)
+		return &v
+	}
+	unknownVal := func() *tftypes.Value {
+		v := tftypes.NewValue(tftypes.String, tftypes.UnknownValue)
+		return &v
+	}
+
+	cases := map[string]struct {
+		rawDiff []tftypes.ValueDiff
+		want    bool
+	}{
+		"EmptyDiff": {
+			rawDiff: []tftypes.ValueDiff{},
+			want:    false,
+		},
+		"PlannedNonNullPriorNull": {
+			rawDiff: []tftypes.ValueDiff{
+				{Value1: strVal("foo"), Value2: nullVal()},
+			},
+			want: true,
+		},
+		"PlannedNonNullPriorNonNull": {
+			rawDiff: []tftypes.ValueDiff{
+				{Value1: strVal("new"), Value2: strVal("old")},
+			},
+			want: true,
+		},
+		// Explicit removal: prior was set, planned is null. The fix ensures
+		// this is not filtered out.
+		"PlannedNullPriorNonNull": {
+			rawDiff: []tftypes.ValueDiff{
+				{Value1: nullVal(), Value2: strVal("foo")},
+			},
+			want: true,
+		},
+		// Field was never specified; both sides are null — no real diff.
+		"PlannedNullPriorNull": {
+			rawDiff: []tftypes.ValueDiff{
+				{Value1: nullVal(), Value2: nullVal()},
+			},
+			want: false,
+		},
+		// Value1 nil means the child attribute has no individual planned value
+		// (e.g. when its parent object is null). Should remain filtered.
+		"PlannedNilPriorNonNull": {
+			rawDiff: []tftypes.ValueDiff{
+				{Value1: nil, Value2: strVal("foo")},
+			},
+			want: false,
+		},
+		// Unknown planned value corresponds to a computed field — filtered.
+		"PlannedUnknownPriorNonNull": {
+			rawDiff: []tftypes.ValueDiff{
+				{Value1: unknownVal(), Value2: strVal("foo")},
+			},
+			want: false,
+		},
+		// Simulates optional nested object removal: child attribute diffs have
+		// nil Value1, but the parent-level diff has null Value1 / non-null
+		// Value2 and must be detected.
+		"NestedObjectRemoval": {
+			rawDiff: []tftypes.ValueDiff{
+				{Value1: nil, Value2: strVal("ClusterIP")}, // child attr, Value1 nil
+				{Value1: nil, Value2: strVal("Cluster")},   // child attr, Value1 nil
+				{Value1: nullVal(), Value2: strVal("3")},   // parent object null → removal
+			},
+			want: true,
+		},
+	}
+
+	client := &terraformPluginFrameworkExternalClient{}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			got := client.filteredDiffExists(context.TODO(), tc.rawDiff)
+			if got != tc.want {
+				t.Errorf("filteredDiffExists() = %v, want %v", got, tc.want)
+			}
+		})
+	}
+}
+
+// diffGatingSchema is a Terraform Plugin Framework resource schema that covers
+// the schema node kinds a reported diff path can point at: the computed-only
+// attributes and their descendants, the atomic collection attributes and their
+// elements, the nested attributes, the blocks and the dynamic attributes.
+func diffGatingSchema() rschema.Schema {
+	nested := map[string]rschema.Attribute{"x": rschema.StringAttribute{Optional: true}}
+	return rschema.Schema{
+		Attributes: map[string]rschema.Attribute{
+			"opt":              rschema.StringAttribute{Optional: true},
+			"opt_computed":     rschema.StringAttribute{Optional: true, Computed: true},
+			"computed_only":    rschema.StringAttribute{Computed: true},
+			"tags":             rschema.MapAttribute{Optional: true, ElementType: types.StringType},
+			"computed_tags":    rschema.MapAttribute{Computed: true, ElementType: types.StringType},
+			"opt_parent":       rschema.SingleNestedAttribute{Optional: true, Attributes: nested},
+			"computed_parent":  rschema.SingleNestedAttribute{Computed: true, Attributes: nested},
+			"opt_dynamic":      rschema.DynamicAttribute{Optional: true},
+			"computed_dynamic": rschema.DynamicAttribute{Computed: true},
+			// the add-on shape of the reported issue: an optional root with the
+			// computed children, so that the removal of the root is detectable
+			"add_ons": rschema.SingleNestedAttribute{
+				Optional: true,
+				Attributes: map[string]rschema.Attribute{
+					"emissary": rschema.SingleNestedAttribute{
+						Optional: true,
+						Attributes: map[string]rschema.Attribute{
+							"replicas": rschema.Int64Attribute{Optional: true, Computed: true},
+						},
+					},
+				},
+			},
+		},
+		Blocks: map[string]rschema.Block{
+			"settings": rschema.SingleNestedBlock{Attributes: nested},
+			"rules":    rschema.ListNestedBlock{NestedObject: rschema.NestedBlockObject{Attributes: nested}},
+		},
+	}
+}
+
+func TestFilteredDiffExistsComputedOnly(t *testing.T) {
+	strVal := func(s string) *tftypes.Value {
+		v := tftypes.NewValue(tftypes.String, s)
+		return &v
+	}
+	nullVal := func() *tftypes.Value {
+		v := tftypes.NewValue(tftypes.String, nil)
+		return &v
+	}
+	unknownVal := func() *tftypes.Value {
+		v := tftypes.NewValue(tftypes.String, tftypes.UnknownValue)
+		return &v
+	}
+	// removal reports a diff where the previously set value at the given path
+	// is now unset, i.e., the planned value is null and the prior value is not.
+	removal := func(p *tftypes.AttributePath) tftypes.ValueDiff {
+		return tftypes.ValueDiff{Path: p, Value1: nullVal(), Value2: strVal("prior")}
+	}
+	path := tftypes.NewAttributePath
+
+	cases := map[string]struct {
+		reason string
+		diff   tftypes.ValueDiff
+		want   bool
+	}{
+		"OptionalAttributeUnset": {
+			reason: "Unsetting an optional attribute is a diff.",
+			diff:   removal(path().WithAttributeName("opt")),
+			want:   true,
+		},
+		"OptionalComputedAttributeUnset": {
+			reason: "Unsetting an optional+computed attribute is a diff because it can be configured.",
+			diff:   removal(path().WithAttributeName("opt_computed")),
+			want:   true,
+		},
+		"ComputedOnlyAttributeUnset": {
+			reason: "A computed-only attribute cannot be unset via the MR spec, so a null planned value is not a diff.",
+			diff:   removal(path().WithAttributeName("computed_only")),
+			want:   false,
+		},
+		"ComputedOnlyAttributeChanged": {
+			reason: "A known and non-null planned value is a diff even for a computed-only attribute.",
+			diff:   tftypes.ValueDiff{Path: path().WithAttributeName("computed_only"), Value1: strVal("planned"), Value2: strVal("prior")},
+			want:   true,
+		},
+		"UnknownPlannedValue": {
+			reason: "An unknown planned value corresponds to a computed field and is not a diff.",
+			diff:   tftypes.ValueDiff{Path: path().WithAttributeName("opt"), Value1: unknownVal(), Value2: strVal("prior")},
+			want:   false,
+		},
+		"OptionalMapElementUnset": {
+			reason: "The elements of an atomic collection attribute are resolved to the enclosing attribute, which is configurable here.",
+			diff:   removal(path().WithAttributeName("tags").WithElementKeyString("env")),
+			want:   true,
+		},
+		"ComputedOnlyMapElementUnset": {
+			reason: "The elements of an atomic collection attribute are resolved to the enclosing attribute, which is computed-only here.",
+			diff:   removal(path().WithAttributeName("computed_tags").WithElementKeyString("env")),
+			want:   false,
+		},
+		"AttributeUnderOptionalParentUnset": {
+			reason: "A configurable attribute under a configurable parent can be unset.",
+			diff:   removal(path().WithAttributeName("opt_parent").WithAttributeName("x")),
+			want:   true,
+		},
+		"AttributeUnderComputedOnlyParentUnset": {
+			reason: "Terraform does not allow a computed-only attribute to be configured, so its descendants cannot be unset either.",
+			diff:   removal(path().WithAttributeName("computed_parent").WithAttributeName("x")),
+			want:   false,
+		},
+		"OptionalNestedAttributeUnset": {
+			reason: "Unsetting an optional nested attribute is a diff, which is the case reported for the add-ons.",
+			diff:   removal(path().WithAttributeName("add_ons").WithAttributeName("emissary")),
+			want:   true,
+		},
+		"ComputedChildOfOptionalNestedAttributeUnset": {
+			reason: "An optional+computed child of a configurable nested attribute can be configured, so unsetting it is a diff.",
+			diff:   removal(path().WithAttributeName("add_ons").WithAttributeName("emissary").WithAttributeName("replicas")),
+			want:   true,
+		},
+		"DynamicSubPathUnderOptionalUnset": {
+			reason: "A path under a dynamic attribute is resolved to the dynamic attribute itself, which is configurable here.",
+			diff:   removal(path().WithAttributeName("opt_dynamic").WithAttributeName("foo")),
+			want:   true,
+		},
+		"DynamicSubPathUnderComputedOnlyUnset": {
+			reason: "A path under a dynamic attribute is resolved to the dynamic attribute itself, which is computed-only here.",
+			diff:   removal(path().WithAttributeName("computed_dynamic").WithAttributeName("foo")),
+			want:   false,
+		},
+		"BlockUnset": {
+			reason: "A block is always configurable, so unsetting it is a diff.",
+			diff:   removal(path().WithAttributeName("settings")),
+			want:   true,
+		},
+		"BlockElementUnset": {
+			reason: "A block element does not resolve to an attribute and the diff is preserved.",
+			diff:   removal(path().WithAttributeName("rules").WithElementKeyInt(0)),
+			want:   true,
+		},
+		"RootPathUnset": {
+			reason: "The root path does not resolve to an attribute and the diff is preserved.",
+			diff:   removal(path()),
+			want:   true,
+		},
+	}
+
+	n := &terraformPluginFrameworkExternalClient{resourceSchema: diffGatingSchema()}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			got := n.filteredDiffExists(context.TODO(), []tftypes.ValueDiff{tc.diff})
+			if diff := cmp.Diff(tc.want, got); diff != "" {
+				t.Errorf("%s\nfilteredDiffExists(...): -want, +got:\n%s", tc.reason, diff)
+			}
+		})
+	}
+}
+
+// TestFilteredDiffExistsNestedAttributeRemoval reproduces the reported
+// scenario, where an optional nested attribute with the computed children is
+// removed from the MR spec, on the raw diff computed by Terraform itself. The
+// child attributes of the removed object have no planned values at all, so only
+// the diff reported for the removed object carries the null planned value.
+func TestFilteredDiffExistsNestedAttributeRemoval(t *testing.T) {
+	ctx := context.TODO()
+	// addOnsSchema returns a resource schema with an "add_ons.emissary" nested
+	// attribute whose children are computed. The emissary attribute itself is
+	// either configurable or computed-only.
+	addOnsSchema := func(emissaryComputedOnly bool) rschema.Schema {
+		emissary := rschema.SingleNestedAttribute{
+			Optional: true,
+			Attributes: map[string]rschema.Attribute{
+				"replicas":     rschema.Int64Attribute{Optional: true, Computed: true},
+				"service_type": rschema.StringAttribute{Optional: true, Computed: true},
+			},
+		}
+		if emissaryComputedOnly {
+			emissary.Optional = false
+			emissary.Computed = true
+		}
+		return rschema.Schema{
+			Attributes: map[string]rschema.Attribute{
+				"add_ons": rschema.SingleNestedAttribute{
+					Optional:   true,
+					Attributes: map[string]rschema.Attribute{"emissary": emissary},
+				},
+			},
+		}
+	}
+
+	cases := map[string]struct {
+		reason string
+		sch    rschema.Schema
+		want   bool
+	}{
+		"ConfigurableAddOnRemoved": {
+			reason: "Removing a configurable nested attribute must be reported as a diff so that an update is issued.",
+			sch:    addOnsSchema(false),
+			want:   true,
+		},
+		"ComputedOnlyAddOnRemoved": {
+			reason: "A computed-only nested attribute cannot be removed via the MR spec, so the raw diff of the provider is filtered.",
+			sch:    addOnsSchema(true),
+			want:   false,
+		},
+	}
+
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			resourceType, ok := tc.sch.Type().TerraformType(ctx).(tftypes.Object)
+			if !ok {
+				t.Fatalf("%s\nresource schema type is not a tftypes.Object", tc.reason)
+			}
+			addOnsType := resourceType.AttributeTypes["add_ons"].(tftypes.Object)  //nolint:forcetypeassert // the type is known from the schema above
+			emissaryType := addOnsType.AttributeTypes["emissary"].(tftypes.Object) //nolint:forcetypeassert // the type is known from the schema above
+			addOns := func(emissary tftypes.Value) tftypes.Value {
+				return tftypes.NewValue(resourceType, map[string]tftypes.Value{
+					"add_ons": tftypes.NewValue(addOnsType, map[string]tftypes.Value{"emissary": emissary}),
+				})
+			}
+			// the external resource has the add-on configured
+			prior := addOns(tftypes.NewValue(emissaryType, map[string]tftypes.Value{
+				"replicas":     tftypes.NewValue(tftypes.Number, 3),
+				"service_type": tftypes.NewValue(tftypes.String, "ClusterIP"),
+			}))
+			// the add-on has been removed from the MR spec
+			planned := addOns(tftypes.NewValue(emissaryType, nil))
+
+			rawDiff, err := planned.Diff(prior)
+			if err != nil {
+				t.Fatalf("%s\ncannot diff the planned and the prior values: %v", tc.reason, err)
+			}
+			if len(rawDiff) == 0 {
+				t.Fatalf("%s\nexpected a non-empty raw diff for the removed add-on", tc.reason)
+			}
+
+			n := &terraformPluginFrameworkExternalClient{resourceSchema: tc.sch}
+			got := n.filteredDiffExists(ctx, rawDiff)
+			if diff := cmp.Diff(tc.want, got); diff != "" {
+				t.Errorf("%s\nfilteredDiffExists(...): -want, +got:\n%s", tc.reason, diff)
+			}
+		})
+	}
+}
+
+func TestFilterRequiresReplace(t *testing.T) {
+	sch := rschema.Schema{
+		Attributes: map[string]rschema.Attribute{
+			"name": rschema.StringAttribute{
+				Required: true,
+			},
+			"ssh_keys": rschema.SetAttribute{
+				Optional:    true,
+				Computed:    true,
+				ElementType: types.StringType,
+			},
+			"nested_set": rschema.SetNestedAttribute{
+				Optional: true,
+				NestedObject: rschema.NestedAttributeObject{
+					Attributes: map[string]rschema.Attribute{
+						"name": rschema.StringAttribute{
+							Required: true,
+						},
+						"keys": rschema.SetAttribute{
+							Optional:    true,
+							ElementType: types.StringType,
+						},
+					},
+				},
+			},
+		},
+		Blocks: map[string]rschema.Block{
+			"import": rschema.SetNestedBlock{
+				NestedObject: rschema.NestedBlockObject{
+					Attributes: map[string]rschema.Attribute{
+						"source": rschema.StringAttribute{
+							Required: true,
+						},
+					},
+					Blocks: map[string]rschema.Block{
+						"header": rschema.SetNestedBlock{
+							NestedObject: rschema.NestedBlockObject{
+								Attributes: map[string]rschema.Attribute{
+									"name": rschema.StringAttribute{
+										Required: true,
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+		},
+	}
+	tfType := sch.Type().TerraformType(context.TODO())
+	valueOf := func(m map[string]any, typ tftypes.Type) tftypes.Value {
+		v, err := tfValueFromMap(m, typ)
+		if err != nil {
+			t.Fatalf("cannot build value: %v", err)
+		}
+		return v
+	}
+	value := func(m map[string]any) tftypes.Value {
+		return valueOf(m, tfType)
+	}
+	path := func(name string) *tftypes.AttributePath {
+		return tftypes.NewAttributePath().WithAttributeName(name)
+	}
+	// elementPath is a path into a set element, as the framework reports it:
+	// the element step carries the raw element, with absent collections null.
+	elementPath := func(set string, element map[string]any, attr string) *tftypes.AttributePath {
+		elementType := tfType.(tftypes.Object).AttributeTypes[set].(tftypes.Set).ElementType
+		return path(set).WithElementKeyValue(valueOf(element, elementType)).WithAttributeName(attr)
+	}
+	newNestedSetElement := elementPath("nested_set", map[string]any{"name": "b"}, "name")
+	newImportElement := elementPath("import", map[string]any{"source": "direct-upload"}, "source")
+	pathStrings := func(paths []*tftypes.AttributePath) []string {
+		if len(paths) == 0 {
+			return nil
+		}
+		out := make([]string, 0, len(paths))
+		for _, p := range paths {
+			out = append(out, p.String())
+		}
+		return out
+	}
+
+	cases := map[string]struct {
+		reason          string
+		prior           map[string]any
+		planned         map[string]any
+		requiresReplace []*tftypes.AttributePath
+		want            []string
+	}{
+		"UnchangedAttribute": {
+			reason:          "A reported path whose prior and planned values are equal is a false positive.",
+			prior:           map[string]any{"name": "a"},
+			planned:         map[string]any{"name": "a"},
+			requiresReplace: []*tftypes.AttributePath{path("name")},
+			want:            nil,
+		},
+		"ChangedAttribute": {
+			reason:          "A reported path whose value changed requires replacement.",
+			prior:           map[string]any{"name": "a"},
+			planned:         map[string]any{"name": "b"},
+			requiresReplace: []*tftypes.AttributePath{path("name")},
+			want:            []string{`AttributeName("name")`},
+		},
+		"NullVersusEmptyIsNotNormalizedHere": {
+			reason:          "The filter compares the values it is given; null-versus-empty collections are normalized by getDiffPlanResponse before it runs.",
+			prior:           map[string]any{"name": "a"},
+			planned:         map[string]any{"name": "a", "ssh_keys": []any{}},
+			requiresReplace: []*tftypes.AttributePath{path("ssh_keys")},
+			want:            []string{`AttributeName("ssh_keys")`},
+		},
+		"NullBlockPlannedElement": {
+			reason:          "A nested block that gains an element requires replacement.",
+			prior:           map[string]any{"name": "a"},
+			planned:         map[string]any{"name": "a", "import": []any{map[string]any{"source": "http-import"}}},
+			requiresReplace: []*tftypes.AttributePath{path("import")},
+			want:            []string{`AttributeName("import")`},
+		},
+		"EmptySetAttributePlannedElement": {
+			reason:          "A set attribute that gains an element requires replacement.",
+			prior:           map[string]any{"name": "a", "ssh_keys": []any{}},
+			planned:         map[string]any{"name": "a", "ssh_keys": []any{"ssh-ed25519 AAAA"}},
+			requiresReplace: []*tftypes.AttributePath{path("ssh_keys")},
+			want:            []string{`AttributeName("ssh_keys")`},
+		},
+		"NewSetElementWithNullCollection": {
+			reason:          "A path into a new set element whose inner collection is null in the path and empty in the normalized plan is found in the plan and requires replacement.",
+			prior:           map[string]any{"name": "a", "nested_set": []any{map[string]any{"name": "a", "keys": []any{}}}},
+			planned:         map[string]any{"name": "a", "nested_set": []any{map[string]any{"name": "a", "keys": []any{}}, map[string]any{"name": "b", "keys": []any{}}}},
+			requiresReplace: []*tftypes.AttributePath{newNestedSetElement},
+			want:            []string{newNestedSetElement.String()},
+		},
+		"NewBlockElementWithNestedBlock": {
+			reason:          "The framework reports a new block element with its nested blocks null while the plan carries them empty; the path is found in the plan and requires replacement.",
+			prior:           map[string]any{"name": "a", "import": []any{map[string]any{"source": "http-import", "header": []any{}}}},
+			planned:         map[string]any{"name": "a", "import": []any{map[string]any{"source": "http-import", "header": []any{}}, map[string]any{"source": "direct-upload", "header": []any{}}}},
+			requiresReplace: []*tftypes.AttributePath{newImportElement},
+			want:            []string{newImportElement.String()},
+		},
+	}
+
+	n := &terraformPluginFrameworkExternalClient{
+		logger:         logTest,
+		resourceSchema: sch,
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			resp := &tfprotov6.PlanResourceChangeResponse{RequiresReplace: tc.requiresReplace}
+			if err := n.filterRequiresReplace(context.TODO(), resp, value(tc.prior), value(tc.planned)); err != nil {
+				t.Fatalf("filterRequiresReplace(...): unexpected error: %v", err)
+			}
+			if diff := cmp.Diff(tc.want, pathStrings(resp.RequiresReplace)); diff != "" {
+				t.Errorf("%s\nfilterRequiresReplace(...): -want, +got:\n%s", tc.reason, diff)
+			}
+		})
+	}
+}
+
+// nullAndEmptyCollectionsSchema holds the attribute shapes in which a null
+// collection in the reconstructed prior state meets an empty collection in
+// the plan: a top-level set with an empty default, a set inside a single
+// nested attribute and a set inside the elements of a set nested attribute.
+func nullAndEmptyCollectionsSchema() rschema.Schema {
+	keys := rschema.SetAttribute{
+		Optional:    true,
+		Computed:    true,
+		ElementType: types.StringType,
+	}
+	return rschema.Schema{
+		Attributes: map[string]rschema.Attribute{
+			"id": rschema.StringAttribute{
+				Computed: true,
+			},
+			"name": rschema.StringAttribute{
+				Required: true,
+			},
+			"ssh_keys": keys,
+			"obj": rschema.SingleNestedAttribute{
+				Optional: true,
+				Attributes: map[string]rschema.Attribute{
+					"keys": keys,
+				},
+			},
+			"nested_set": rschema.SetNestedAttribute{
+				Optional: true,
+				NestedObject: rschema.NestedAttributeObject{
+					Attributes: map[string]rschema.Attribute{
+						"name": rschema.StringAttribute{
+							Required: true,
+						},
+						"keys": keys,
+					},
+				},
+			},
+		},
+	}
+}
+
+// TestTPFObserveNullAndEmptyCollections covers the state a resource is in
+// after a provider restart or once its status is dropped: the prior state
+// reconstructed from the MR has unset collections as null, the plan carries
+// them as empty collections and lists the path under RequiresReplace. The
+// resource must be observed as up to date and the following Update must not
+// be refused as a replacement, while a collection that gains an element still
+// is a diff that requires replacement.
+func TestTPFObserveNullAndEmptyCollections(t *testing.T) {
+	path := func(name string) *tftypes.AttributePath {
+		return tftypes.NewAttributePath().WithAttributeName(name)
+	}
+	cases := map[string]struct {
+		reason          string
+		prior           map[string]any
+		planned         map[string]any
+		requiresReplace *tftypes.AttributePath
+		wantUpToDate    bool
+		wantUpdateErr   bool
+	}{
+		"SetAttributeEmptyDefault": {
+			reason:          "A set attribute that is null in the prior state and empty in the plan is not a diff and not a replacement.",
+			prior:           map[string]any{"id": "example-id", "name": "example"},
+			planned:         map[string]any{"id": "example-id", "name": "example", "ssh_keys": []any{}},
+			requiresReplace: path("ssh_keys"),
+			wantUpToDate:    true,
+		},
+		"SetAttributePlannedNullPriorEmpty": {
+			reason:          "The comparison is symmetric: an empty prior against a null plan is not a diff either.",
+			prior:           map[string]any{"id": "example-id", "name": "example", "ssh_keys": []any{}},
+			planned:         map[string]any{"id": "example-id", "name": "example"},
+			requiresReplace: path("ssh_keys"),
+			wantUpToDate:    true,
+		},
+		"SetAttributeInsideSingleNestedAttribute": {
+			reason:          "A null set inside a single nested attribute is normalized before the parent object is compared.",
+			prior:           map[string]any{"id": "example-id", "name": "example", "obj": map[string]any{}},
+			planned:         map[string]any{"id": "example-id", "name": "example", "obj": map[string]any{"keys": []any{}}},
+			requiresReplace: path("obj"),
+			wantUpToDate:    true,
+		},
+		"SetAttributeInsideSetNestedAttribute": {
+			reason:          "A null set inside a set element is normalized before the elements are matched by value.",
+			prior:           map[string]any{"id": "example-id", "name": "example", "nested_set": []any{map[string]any{"name": "a"}}},
+			planned:         map[string]any{"id": "example-id", "name": "example", "nested_set": []any{map[string]any{"name": "a", "keys": []any{}}}},
+			requiresReplace: path("nested_set"),
+			wantUpToDate:    true,
+		},
+		"SetAttributeGainsElement": {
+			reason:          "A set attribute that gains an element is a diff and keeps its replacement requirement.",
+			prior:           map[string]any{"id": "example-id", "name": "example"},
+			planned:         map[string]any{"id": "example-id", "name": "example", "ssh_keys": []any{"ssh-ed25519 AAAA"}},
+			requiresReplace: path("ssh_keys"),
+			wantUpToDate:    false,
+			wantUpdateErr:   true,
+		},
+		"SetNestedAttributeGainsElement": {
+			reason:          "A set nested attribute that gains an element is a diff and keeps its replacement requirement.",
+			prior:           map[string]any{"id": "example-id", "name": "example", "nested_set": []any{map[string]any{"name": "a"}}},
+			planned:         map[string]any{"id": "example-id", "name": "example", "nested_set": []any{map[string]any{"name": "a", "keys": []any{}}, map[string]any{"name": "b", "keys": []any{}}}},
+			requiresReplace: path("nested_set"),
+			wantUpToDate:    false,
+			wantUpdateErr:   true,
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			tcfg := testConfiguration{
+				r: &mockTPFResource{
+					SchemaMethod: func(_ context.Context, _ resource.SchemaRequest, response *resource.SchemaResponse) {
+						response.Schema = nullAndEmptyCollectionsSchema()
+					},
+				},
+				cfg: newBaseUpjetConfig(),
+				obj: fake.Terraformed{
+					Parameterizable: fake.Parameterizable{Parameters: map[string]any{"name": "example"}},
+					Observable:      fake.Observable{Observation: map[string]any{}},
+				},
+				params:              map[string]any{"id": "example-id", "name": "example"},
+				currentStateMap:     tc.prior,
+				plannedStateMap:     tc.planned,
+				newStateMap:         tc.planned,
+				planRequiresReplace: []*tftypes.AttributePath{tc.requiresReplace},
+			}
+			tpfExternal := prepareTPFExternalWithTestConfig(tcfg)
+
+			obs, err := tpfExternal.Observe(context.TODO(), &tcfg.obj)
+			if err != nil {
+				t.Fatalf("%s\nObserve(...): unexpected error: %v", tc.reason, err)
+			}
+			if !obs.ResourceExists {
+				t.Errorf("%s\nObserve(...): want ResourceExists, got %+v", tc.reason, obs)
+			}
+			if diff := cmp.Diff(tc.wantUpToDate, obs.ResourceUpToDate); diff != "" {
+				t.Errorf("%s\nObserve(...) ResourceUpToDate: -want, +got:\n%s", tc.reason, diff)
+			}
+			_, err = tpfExternal.Update(context.TODO(), &tcfg.obj)
+			if diff := cmp.Diff(tc.wantUpdateErr, err != nil); diff != "" {
+				t.Errorf("%s\nUpdate(...) returned error %v: -wantErr, +gotErr:\n%s", tc.reason, err, diff)
+			}
+		})
+	}
+}
+
+func TestNullCollectionsAsEmpty(t *testing.T) {
+	strSet := tftypes.Set{ElementType: tftypes.String}
+	strList := tftypes.List{ElementType: tftypes.String}
+	strMap := tftypes.Map{ElementType: tftypes.String}
+	inner := tftypes.Object{AttributeTypes: map[string]tftypes.Type{"keys": strSet}}
+	typ := tftypes.Object{AttributeTypes: map[string]tftypes.Type{
+		"s":   strSet,
+		"l":   strList,
+		"m":   strMap,
+		"str": tftypes.String,
+		"o":   inner,
+		"ns":  tftypes.Set{ElementType: inner},
+	}}
+	str := func(s string) tftypes.Value { return tftypes.NewValue(tftypes.String, s) }
+	elems := func(vals ...tftypes.Value) []tftypes.Value { return vals }
+
+	cases := map[string]struct {
+		reason string
+		in     tftypes.Value
+		want   tftypes.Value
+	}{
+		"NullCollectionsBecomeEmptyAtEveryDepth": {
+			reason: "Null lists, sets and maps become empty at the top level, inside an object and inside set elements; other null values are kept.",
+			in: tftypes.NewValue(typ, map[string]tftypes.Value{
+				"s":   tftypes.NewValue(strSet, nil),
+				"l":   tftypes.NewValue(strList, nil),
+				"m":   tftypes.NewValue(strMap, nil),
+				"str": tftypes.NewValue(tftypes.String, nil),
+				"o":   tftypes.NewValue(inner, map[string]tftypes.Value{"keys": tftypes.NewValue(strSet, nil)}),
+				"ns":  tftypes.NewValue(tftypes.Set{ElementType: inner}, elems(tftypes.NewValue(inner, map[string]tftypes.Value{"keys": tftypes.NewValue(strSet, nil)}))),
+			}),
+			want: tftypes.NewValue(typ, map[string]tftypes.Value{
+				"s":   tftypes.NewValue(strSet, elems()),
+				"l":   tftypes.NewValue(strList, elems()),
+				"m":   tftypes.NewValue(strMap, map[string]tftypes.Value{}),
+				"str": tftypes.NewValue(tftypes.String, nil),
+				"o":   tftypes.NewValue(inner, map[string]tftypes.Value{"keys": tftypes.NewValue(strSet, elems())}),
+				"ns":  tftypes.NewValue(tftypes.Set{ElementType: inner}, elems(tftypes.NewValue(inner, map[string]tftypes.Value{"keys": tftypes.NewValue(strSet, elems())}))),
+			}),
+		},
+		"NullObjectsUnknownAndNonEmptyValuesAreKept": {
+			reason: "A null object stays null, an unknown collection stays unknown and collections with elements are untouched.",
+			in: tftypes.NewValue(typ, map[string]tftypes.Value{
+				"s":   tftypes.NewValue(strSet, tftypes.UnknownValue),
+				"l":   tftypes.NewValue(strList, elems(str("a"))),
+				"m":   tftypes.NewValue(strMap, map[string]tftypes.Value{"k": str("v")}),
+				"str": str("x"),
+				"o":   tftypes.NewValue(inner, nil),
+				"ns":  tftypes.NewValue(tftypes.Set{ElementType: inner}, nil),
+			}),
+			want: tftypes.NewValue(typ, map[string]tftypes.Value{
+				"s":   tftypes.NewValue(strSet, tftypes.UnknownValue),
+				"l":   tftypes.NewValue(strList, elems(str("a"))),
+				"m":   tftypes.NewValue(strMap, map[string]tftypes.Value{"k": str("v")}),
+				"str": str("x"),
+				"o":   tftypes.NewValue(inner, nil),
+				"ns":  tftypes.NewValue(tftypes.Set{ElementType: inner}, elems()),
+			}),
+		},
+	}
+	for name, tc := range cases {
+		t.Run(name, func(t *testing.T) {
+			got, err := nullCollectionsAsEmpty(tc.in)
+			if err != nil {
+				t.Fatalf("%s\nnullCollectionsAsEmpty(...): unexpected error: %v", tc.reason, err)
+			}
+			if !got.Equal(tc.want) {
+				t.Errorf("%s\nnullCollectionsAsEmpty(...):\nwant: %s\ngot:  %s", tc.reason, tc.want, got)
+			}
+		})
+	}
 }

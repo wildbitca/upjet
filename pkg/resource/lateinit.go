@@ -134,7 +134,7 @@ func zeroValueJSONOmitEmptyFilter(cName string) ValueFilter {
 			return true
 		case (k == reflect.Slice || k == reflect.Map) && v.Len() == 0:
 			return true
-		case k == reflect.Ptr && v.Elem().IsZero():
+		case k == reflect.Pointer && v.Elem().IsZero():
 			return true
 		default:
 			return false
@@ -159,7 +159,7 @@ func zeroElemPtrFilter(cName string) ValueFilter {
 		}
 
 		t := v.Type()
-		if t.Kind() != reflect.Ptr || v.IsNil() {
+		if t.Kind() != reflect.Pointer || v.IsNil() {
 			return false
 		}
 		if v.Elem().IsZero() {
@@ -220,10 +220,10 @@ func (li *GenericLateInitializer) LateInitialize(desiredObject, observedObject a
 	}
 
 	typeOfDesiredObject, typeOfObservedObject := reflect.TypeOf(desiredObject), reflect.TypeOf(observedObject)
-	if typeOfDesiredObject.Kind() != reflect.Ptr || typeOfDesiredObject.Elem().Kind() != reflect.Struct {
+	if typeOfDesiredObject.Kind() != reflect.Pointer || typeOfDesiredObject.Elem().Kind() != reflect.Struct {
 		return false, errors.Errorf(errFmtNotPtrToStruct, "desiredObject", desiredObject)
 	}
-	if typeOfObservedObject.Kind() != reflect.Ptr || typeOfObservedObject.Elem().Kind() != reflect.Struct {
+	if typeOfObservedObject.Kind() != reflect.Pointer || typeOfObservedObject.Elem().Kind() != reflect.Struct {
 		return false, errors.Errorf(errFmtNotPtrToStruct, "observedObject", observedObject)
 	}
 	if reflect.TypeOf(desiredObject) != reflect.TypeOf(observedObject) {
@@ -294,7 +294,7 @@ func (li *GenericLateInitializer) handleStruct(parentName string, desiredObject 
 
 		switch desiredStructField.Type.Kind() { //nolint:exhaustive
 		// handle pointer struct field
-		case reflect.Ptr:
+		case reflect.Pointer:
 			desiredKeepField, err = li.handlePtr(cName, desiredFieldValue, observedFieldValue)
 
 		case reflect.Slice:
@@ -334,7 +334,7 @@ func (li *GenericLateInitializer) handlePtr(cName string, desiredFieldValue, obs
 		desiredKeepField = nestedFieldAssigned
 
 	default: // then cr object's field is not set but response object contains a value, carry it
-		if desiredFieldValue.Kind() == reflect.Ptr && desiredFieldValue.IsNil() {
+		if desiredFieldValue.Kind() == reflect.Pointer && desiredFieldValue.IsNil() {
 			desiredFieldValue.Set(reflect.New(desiredFieldValue.Type().Elem()))
 		}
 
@@ -364,7 +364,7 @@ func (li *GenericLateInitializer) handleSlice(cName string, desiredFieldValue, o
 		// check slice item's kind (not slice type)
 		switch item.Elem().Kind() { //nolint:exhaustive
 		// if dealing with a slice of pointers
-		case reflect.Ptr:
+		case reflect.Pointer:
 			_, err = li.handlePtr(cName, item.Elem(), observedFieldValue.Index(i))
 		case reflect.Struct:
 			_, err = li.handleStruct(cName, item.Interface(), observedFieldValue.Index(i).Addr().Interface())
@@ -407,7 +407,7 @@ func (li *GenericLateInitializer) handleMap(cName string, desiredFieldValue, obs
 		// check map item's kind (not map type)
 		switch item.Elem().Kind() { //nolint:exhaustive
 		// if dealing with a slice of pointers
-		case reflect.Ptr:
+		case reflect.Pointer:
 			_, err = li.handlePtr(cName, item.Elem(), observedFieldValue.MapIndex(k))
 		// else if dealing with a slice of slices
 		case reflect.Slice:

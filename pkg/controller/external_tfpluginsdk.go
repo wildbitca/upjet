@@ -10,12 +10,12 @@ import (
 	"strings"
 	"time"
 
-	xpv1 "github.com/crossplane/crossplane-runtime/v2/apis/common/v1"
 	"github.com/crossplane/crossplane-runtime/v2/pkg/fieldpath"
 	"github.com/crossplane/crossplane-runtime/v2/pkg/logging"
 	"github.com/crossplane/crossplane-runtime/v2/pkg/meta"
 	"github.com/crossplane/crossplane-runtime/v2/pkg/reconciler/managed"
 	xpresource "github.com/crossplane/crossplane-runtime/v2/pkg/resource"
+	xpv2 "github.com/crossplane/crossplane/apis/v2/core/v2"
 	"github.com/hashicorp/go-cty/cty"
 	tfdiag "github.com/hashicorp/terraform-plugin-sdk/v2/diag"
 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/schema"
@@ -221,9 +221,14 @@ func (c *TerraformPluginSDKConnector) applyHCLParserToParam(sc *schema.Schema, p
 			}
 		}
 	case schema.TypeString:
+		paramStr, ok := param.(string)
+		if !ok {
+			c.logger.Debug("expected parameter value to be string", "parameterType", fmt.Sprintf("%T", param))
+			return param
+		}
 		// For String types check if it is an HCL string and process
-		if isHCLSnippetPattern.MatchString(param.(string)) {
-			hclProccessedParam, err := processHCLParam(param.(string))
+		if isHCLSnippetPattern.MatchString(paramStr) {
+			hclProccessedParam, err := processHCLParam(paramStr)
 			if err != nil {
 				c.logger.Debug("could not process param, returning original", "param", sc.GoString())
 			} else {
@@ -323,7 +328,7 @@ func (c *TerraformPluginSDKConnector) Connect(ctx context.Context, mg xpresource
 	}, nil
 }
 
-func filterInitExclusiveDiffs(tr resource.Terraformed, instanceDiff *tf.InstanceDiff) error { //nolint:gocyclo
+func filterInitExclusiveDiffs(tr resource.Terraformed, instanceDiff *tf.InstanceDiff, cfg *config.Resource) error { //nolint:gocyclo
 	if instanceDiff == nil || instanceDiff.Empty() {
 		return nil
 	}
@@ -332,9 +337,17 @@ func filterInitExclusiveDiffs(tr resource.Terraformed, instanceDiff *tf.Instance
 	if err != nil {
 		return errors.Wrap(err, "cannot get spec.forProvider parameters")
 	}
+	paramsForProvider, err = cfg.ApplyTFConversions(paramsForProvider, config.ToTerraform)
+	if err != nil {
+		return errors.Wrap(err, "cannot apply tf conversions to spec.forProvider parameters")
+	}
 	paramsInitProvider, err := tr.GetInitParameters()
 	if err != nil {
 		return errors.Wrap(err, "cannot get spec.initProvider parameters")
+	}
+	paramsInitProvider, err = cfg.ApplyTFConversions(paramsInitProvider, config.ToTerraform)
+	if err != nil {
+		return errors.Wrap(err, "cannot apply tf conversions to spec.initProvider parameters")
 	}
 
 	initProviderExclusiveParamKeys := getTerraformIgnoreChanges(paramsForProvider, paramsInitProvider)
@@ -451,7 +464,7 @@ func (n *terraformPluginSDKExternal) getResourceDataDiff(tr resource.Terraformed
 	}
 
 	if resourceExists {
-		if err := filterInitExclusiveDiffs(tr, instanceDiff); err != nil {
+		if err := filterInitExclusiveDiffs(tr, instanceDiff, n.config); err != nil {
 			return nil, errors.Wrap(err, "failed to filter the diffs exclusive to spec.initProvider in the terraform.InstanceDiff")
 		}
 	}
@@ -516,11 +529,23 @@ func (n *terraformPluginSDKExternal) Observe(ctx context.Context, mg xpresource.
 	} else if diffState != nil {
 		diffState.Attributes = nil
 		diffState.ID = ""
+		// We still need to populate a non-nil RawPlan & RawConfig in InstanceState
+		// as the Terraform provider being called with this state may assume that
+		// they are not nil. An example is Terraform AWS provider's
+		// transparent tagging interceptor, which calls
+		// ResourceDiff.GetRawPlan().GetAttr("tags"), which will panic on the
+		// zero cty.Value with "value is not an object".
+		if diffState.RawPlan.IsNull() {
+			diffState.RawPlan = n.rawConfig
+		}
+		if diffState.RawConfig.IsNull() {
+			diffState.RawConfig = n.rawConfig
+		}
 	}
 
 	n.instanceDiff = nil
-	policySet := sets.New[xpv1.ManagementAction](mg.(resource.Terraformed).GetManagementPolicies()...)
-	observeOnlyPolicy := sets.New(xpv1.ManagementActionObserve)
+	policySet := sets.New[xpv2.ManagementAction](mg.(resource.Terraformed).GetManagementPolicies()...)
+	observeOnlyPolicy := sets.New(xpv2.ManagementActionObserve)
 	isObserveOnlyPolicy := policySet.Equal(observeOnlyPolicy)
 	if !isObserveOnlyPolicy || !n.isManagementPoliciesEnabled {
 		n.instanceDiff, err = n.getResourceDataDiff(mg.(resource.Terraformed), ctx, diffState, resourceExists)
@@ -542,11 +567,11 @@ func (n *terraformPluginSDKExternal) Observe(ctx context.Context, mg xpresource.
 	var connDetails managed.ConnectionDetails
 	specUpdateRequired := false
 	if resourceExists {
-		if mg.GetCondition(xpv1.TypeReady).Status == corev1.ConditionUnknown ||
-			mg.GetCondition(xpv1.TypeReady).Status == corev1.ConditionFalse {
+		if mg.GetCondition(xpv2.TypeReady).Status == corev1.ConditionUnknown ||
+			mg.GetCondition(xpv2.TypeReady).Status == corev1.ConditionFalse {
 			addTTR(mg)
 		}
-		mg.SetConditions(xpv1.Available())
+		mg.SetConditions(xpv2.Available())
 
 		// we get the connection details from the observed state before
 		// the conversion because the sensitive paths assume the native Terraform
@@ -565,7 +590,7 @@ func (n *terraformPluginSDKExternal) Observe(ctx context.Context, mg xpresource.
 			return managed.ExternalObservation{}, errors.Wrap(err, "cannot marshal the attributes of the new state for late-initialization")
 		}
 
-		policyHasLateInit := policySet.HasAny(xpv1.ManagementActionLateInitialize, xpv1.ManagementActionAll)
+		policyHasLateInit := policySet.HasAny(xpv2.ManagementActionLateInitialize, xpv2.ManagementActionAll)
 		if policyHasLateInit {
 			specUpdateRequired, err = mg.(resource.Terraformed).LateInitialize(buff)
 			if err != nil {

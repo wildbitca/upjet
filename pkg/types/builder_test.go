@@ -8,12 +8,13 @@ import (
 	"fmt"
 	"go/token"
 	"go/types"
+	"strings"
 	"testing"
 
+	"github.com/crossplane/crossplane-runtime/v2/pkg/errors"
 	"github.com/crossplane/crossplane-runtime/v2/pkg/test"
 	"github.com/google/go-cmp/cmp"
 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/schema"
-	"github.com/pkg/errors"
 
 	"github.com/crossplane/upjet/v2/pkg/config"
 	conversiontfjson "github.com/crossplane/upjet/v2/pkg/types/conversion/tfjson"
@@ -210,16 +211,109 @@ func TestBuilder_generateTypeName(t *testing.T) {
 	}
 }
 
+func TestInjectServerSideApplyListMergeKeys(t *testing.T) {
+	type want struct {
+		description string
+		err         error
+	}
+	cases := map[string]struct {
+		cfg  *config.Resource
+		want want
+	}{
+		"DefaultDescription": {
+			cfg: &config.Resource{
+				TerraformResource: &schema.Resource{
+					Schema: map[string]*schema.Schema{
+						"rule": {
+							Type: schema.TypeList,
+							Elem: &schema.Resource{
+								Schema: map[string]*schema.Schema{
+									"name": {Type: schema.TypeString},
+								},
+							},
+						},
+					},
+				},
+				ServerSideApplyMergeStrategies: map[string]config.MergeStrategy{
+					"rule": {
+						ListMergeStrategy: config.ListMergeStrategy{
+							MergeStrategy: config.ListTypeMap,
+							ListMapKeys: config.ListMapKeys{
+								InjectedKey: config.InjectedKey{
+									Key: "index",
+								},
+							},
+						},
+					},
+				},
+			},
+			want: want{
+				description: descriptionInjectedKey,
+			},
+		},
+		"CustomDescription": {
+			cfg: &config.Resource{
+				TerraformResource: &schema.Resource{
+					Schema: map[string]*schema.Schema{
+						"rule": {
+							Type: schema.TypeList,
+							Elem: &schema.Resource{
+								Schema: map[string]*schema.Schema{
+									"name": {Type: schema.TypeString},
+								},
+							},
+						},
+					},
+				},
+				ServerSideApplyMergeStrategies: map[string]config.MergeStrategy{
+					"rule": {
+						ListMergeStrategy: config.ListMergeStrategy{
+							MergeStrategy: config.ListTypeMap,
+							ListMapKeys: config.ListMapKeys{
+								InjectedKey: config.InjectedKey{
+									Key:         "index",
+									Description: "Custom description for the injected key.",
+								},
+							},
+						},
+					},
+				},
+			},
+			want: want{
+				description: "Custom description for the injected key.",
+			},
+		},
+	}
+	for n, tc := range cases {
+		t.Run(n, func(t *testing.T) {
+			err := injectServerSideApplyListMergeKeys(tc.cfg)
+			if diff := cmp.Diff(tc.want.err, err, test.EquateErrors()); diff != "" {
+				t.Fatalf("injectServerSideApplyListMergeKeys(...): -want error, +got error: %s", diff)
+			}
+			if err != nil {
+				return
+			}
+			el := tc.cfg.TerraformResource.Schema["rule"].Elem.(*schema.Resource)
+			got := el.Schema["index"].Description
+			if diff := cmp.Diff(tc.want.description, got); diff != "" {
+				t.Errorf("injectServerSideApplyListMergeKeys(...) description: -want, +got: %s", diff)
+			}
+		})
+	}
+}
+
 func TestBuild(t *testing.T) {
 	type args struct {
-		crdScope CRDScope
-		cfg      *config.Resource
+		crdScope  CRDScope
+		cfg       *config.Resource
+		setupFunc func(*config.Resource)
 	}
 	type want struct {
 		forProvider     string
 		atProvider      string
 		validationRules string
 		err             error
+		commentChecks   map[string]func(t *testing.T, comments map[string]string)
 	}
 	cases := map[string]struct {
 		args
@@ -358,7 +452,7 @@ func TestBuild(t *testing.T) {
 				},
 			},
 			want: want{
-				forProvider: `type example.Parameters struct{Key1SecretRef *github.com/crossplane/crossplane-runtime/v2/apis/common/v1.SecretKeySelector "json:\"key1SecretRef,omitempty\" tf:\"-\""; Key2SecretRef github.com/crossplane/crossplane-runtime/v2/apis/common/v1.SecretKeySelector "json:\"key2SecretRef\" tf:\"-\""; Key3SecretRef []github.com/crossplane/crossplane-runtime/v2/apis/common/v1.SecretKeySelector "json:\"key3SecretRef\" tf:\"-\""}`,
+				forProvider: `type example.Parameters struct{Key1SecretRef *github.com/crossplane/crossplane/apis/v2/core/v2.SecretKeySelector "json:\"key1SecretRef,omitempty\" tf:\"-\""; Key2SecretRef github.com/crossplane/crossplane/apis/v2/core/v2.SecretKeySelector "json:\"key2SecretRef\" tf:\"-\""; Key3SecretRef []github.com/crossplane/crossplane/apis/v2/core/v2.SecretKeySelector "json:\"key3SecretRef\" tf:\"-\""}`,
 				atProvider:  `type example.Observation struct{}`,
 				validationRules: `
 // +kubebuilder:validation:XValidation:rule="!('*' in self.managementPolicies || 'Create' in self.managementPolicies || 'Update' in self.managementPolicies) || has(self.forProvider.key2SecretRef)",message="spec.forProvider.key2SecretRef is a required parameter"
@@ -409,7 +503,7 @@ func TestBuild(t *testing.T) {
 				},
 			},
 			want: want{
-				forProvider: `type example.Parameters struct{Name *string "json:\"name,omitempty\" tf:\"name,omitempty\""; ReferenceID *string "json:\"referenceId,omitempty\" tf:\"reference_id,omitempty\""; ExternalResourceID *github.com/crossplane/crossplane-runtime/v2/apis/common/v1.Reference "json:\"externalResourceId,omitempty\" tf:\"-\""; ReferenceIDSelector *github.com/crossplane/crossplane-runtime/v2/apis/common/v1.Selector "json:\"referenceIdSelector,omitempty\" tf:\"-\""}`,
+				forProvider: `type example.Parameters struct{Name *string "json:\"name,omitempty\" tf:\"name,omitempty\""; ReferenceID *string "json:\"referenceId,omitempty\" tf:\"reference_id,omitempty\""; ExternalResourceID *github.com/crossplane/crossplane/apis/v2/core/v2.Reference "json:\"externalResourceId,omitempty\" tf:\"-\""; ReferenceIDSelector *github.com/crossplane/crossplane/apis/v2/core/v2.Selector "json:\"referenceIdSelector,omitempty\" tf:\"-\""}`,
 				atProvider:  `type example.Observation struct{Name *string "json:\"name,omitempty\" tf:\"name,omitempty\""; ReferenceID *string "json:\"referenceId,omitempty\" tf:\"reference_id,omitempty\""}`,
 				validationRules: `
 // +kubebuilder:validation:XValidation:rule="!('*' in self.managementPolicies || 'Create' in self.managementPolicies || 'Update' in self.managementPolicies) || has(self.forProvider.name) || (has(self.initProvider) && has(self.initProvider.name))",message="spec.forProvider.name is a required parameter"`,
@@ -565,7 +659,7 @@ func TestBuild(t *testing.T) {
 				},
 			},
 			want: want{
-				forProvider: `type example.Parameters struct{Key1SecretRef *github.com/crossplane/crossplane-runtime/v2/apis/common/v1.LocalSecretKeySelector "json:\"key1SecretRef,omitempty\" tf:\"-\""; Key2SecretRef github.com/crossplane/crossplane-runtime/v2/apis/common/v1.LocalSecretKeySelector "json:\"key2SecretRef\" tf:\"-\""; Key3SecretRef []github.com/crossplane/crossplane-runtime/v2/apis/common/v1.LocalSecretKeySelector "json:\"key3SecretRef\" tf:\"-\""}`,
+				forProvider: `type example.Parameters struct{Key1SecretRef *github.com/crossplane/crossplane/apis/v2/core/v2.LocalSecretKeySelector "json:\"key1SecretRef,omitempty\" tf:\"-\""; Key2SecretRef github.com/crossplane/crossplane/apis/v2/core/v2.LocalSecretKeySelector "json:\"key2SecretRef\" tf:\"-\""; Key3SecretRef []github.com/crossplane/crossplane/apis/v2/core/v2.LocalSecretKeySelector "json:\"key3SecretRef\" tf:\"-\""}`,
 				atProvider:  `type example.Observation struct{}`,
 				validationRules: `
 // +kubebuilder:validation:XValidation:rule="!('*' in self.managementPolicies || 'Create' in self.managementPolicies || 'Update' in self.managementPolicies) || has(self.forProvider.key2SecretRef)",message="spec.forProvider.key2SecretRef is a required parameter"
@@ -616,7 +710,7 @@ func TestBuild(t *testing.T) {
 				},
 			},
 			want: want{
-				forProvider: `type example.Parameters struct{Name *string "json:\"name,omitempty\" tf:\"name,omitempty\""; ReferenceID *string "json:\"referenceId,omitempty\" tf:\"reference_id,omitempty\""; ExternalResourceID *github.com/crossplane/crossplane-runtime/v2/apis/common/v1.NamespacedReference "json:\"externalResourceId,omitempty\" tf:\"-\""; ReferenceIDSelector *github.com/crossplane/crossplane-runtime/v2/apis/common/v1.NamespacedSelector "json:\"referenceIdSelector,omitempty\" tf:\"-\""}`,
+				forProvider: `type example.Parameters struct{Name *string "json:\"name,omitempty\" tf:\"name,omitempty\""; ReferenceID *string "json:\"referenceId,omitempty\" tf:\"reference_id,omitempty\""; ExternalResourceID *github.com/crossplane/crossplane/apis/v2/core/v2.NamespacedReference "json:\"externalResourceId,omitempty\" tf:\"-\""; ReferenceIDSelector *github.com/crossplane/crossplane/apis/v2/core/v2.NamespacedSelector "json:\"referenceIdSelector,omitempty\" tf:\"-\""}`,
 				atProvider:  `type example.Observation struct{Name *string "json:\"name,omitempty\" tf:\"name,omitempty\""; ReferenceID *string "json:\"referenceId,omitempty\" tf:\"reference_id,omitempty\""}`,
 				validationRules: `
 // +kubebuilder:validation:XValidation:rule="!('*' in self.managementPolicies || 'Create' in self.managementPolicies || 'Update' in self.managementPolicies) || has(self.forProvider.name) || (has(self.initProvider) && has(self.initProvider.name))",message="spec.forProvider.name is a required parameter"`,
@@ -669,9 +763,121 @@ func TestBuild(t *testing.T) {
 // +kubebuilder:validation:XValidation:rule="!('*' in self.managementPolicies || 'Create' in self.managementPolicies || 'Update' in self.managementPolicies) || has(self.forProvider.__namespace__) || (has(self.initProvider) && has(self.initProvider.__namespace__))",message="spec.forProvider.namespace is a required parameter"`,
 			},
 		},
+		// When a field is both marked as required (via MarkAsRequired) and has a
+		// reference configured, NewReferenceField resets f.Required to false because
+		// the field is satisfiable via *Ref/*Selector. No XValidation should be emitted.
+		"Required_Field_With_Reference_Omits_XValidation": {
+			args: args{
+				crdScope: CRDScopeCluster,
+				cfg: &config.Resource{
+					TerraformResource: &schema.Resource{
+						Schema: map[string]*schema.Schema{
+							"name": {
+								Type:     schema.TypeString,
+								Required: true,
+							},
+							"subnet_id": {
+								Type:     schema.TypeString,
+								Required: true,
+							},
+						},
+					},
+					References: map[string]config.Reference{
+						"subnet_id": {
+							TerraformName: "aws_subnet",
+						},
+					},
+				},
+				setupFunc: func(r *config.Resource) {
+					r.MarkAsRequired("subnet_id")
+				},
+			},
+			want: want{
+				forProvider: `type example.Parameters struct{Name *string "json:\"name,omitempty\" tf:\"name,omitempty\""; SubnetID *string "json:\"subnetId,omitempty\" tf:\"subnet_id,omitempty\""; SubnetIDRef *github.com/crossplane/crossplane/apis/v2/core/v2.Reference "json:\"subnetIdRef,omitempty\" tf:\"-\""; SubnetIDSelector *github.com/crossplane/crossplane/apis/v2/core/v2.Selector "json:\"subnetIdSelector,omitempty\" tf:\"-\""}`,
+				atProvider:  `type example.Observation struct{Name *string "json:\"name,omitempty\" tf:\"name,omitempty\""; SubnetID *string "json:\"subnetId,omitempty\" tf:\"subnet_id,omitempty\""}`,
+				// Only "name" should have an XValidation; "subnet_id" is satisfiable via SubnetIDRef/SubnetIDSelector.
+				validationRules: `
+// +kubebuilder:validation:XValidation:rule="!('*' in self.managementPolicies || 'Create' in self.managementPolicies || 'Update' in self.managementPolicies) || has(self.forProvider.name) || (has(self.initProvider) && has(self.initProvider.name))",message="spec.forProvider.name is a required parameter"`,
+			},
+		},
+		"SSA_InjectedKey_Not_In_Observation_Comments": {
+			args: args{
+				crdScope: CRDScopeCluster,
+				cfg: &config.Resource{
+					TerraformResource: &schema.Resource{
+						Schema: map[string]*schema.Schema{
+							"rule": {
+								Type:     schema.TypeList,
+								Optional: true,
+								Elem: &schema.Resource{
+									Schema: map[string]*schema.Schema{
+										"name": {
+											Type:     schema.TypeString,
+											Required: true,
+										},
+										"action": {
+											Type:     schema.TypeString,
+											Required: true},
+									},
+								},
+							},
+						},
+					},
+					ServerSideApplyMergeStrategies: config.ServerSideApplyMergeStrategies{
+						"rule": {
+							ListMergeStrategy: config.ListMergeStrategy{
+								MergeStrategy: config.ListTypeMap,
+								ListMapKeys: config.ListMapKeys{
+									InjectedKey: config.InjectedKey{
+										Key:          "ruleIndex",
+										DefaultValue: "0",
+									},
+								},
+							},
+						},
+					},
+				},
+			},
+			want: want{
+				forProvider: `type example.Parameters struct{Rule []example.RuleParameters "json:\"rule,omitempty\" tf:\"rule,omitempty\""}`,
+				atProvider:  `type example.Observation struct{Rule []example.RuleObservation "json:\"rule,omitempty\" tf:\"rule,omitempty\""}`,
+				commentChecks: map[string]func(t *testing.T, comments map[string]string){
+					"ParametersRuleHasSSAMarkers": func(t *testing.T, comments map[string]string) {
+						t.Helper()
+						v := comments["example.Parameters:Rule"]
+						if !strings.Contains(v, "+listType=map") {
+							t.Errorf("Parameters Rule comment missing +listType=map: %s", v)
+						}
+						if !strings.Contains(v, "+listMapKey=ruleIndex") {
+							t.Errorf("Parameters Rule comment missing +listMapKey=ruleIndex: %s", v)
+						}
+					},
+					"ObservationRuleNoSSAMarkers": func(t *testing.T, comments map[string]string) {
+						t.Helper()
+						v := comments["example.Observation:Rule"]
+						if strings.Contains(v, "+listType=map") {
+							t.Errorf("Observation Rule comment must not contain +listType=map: %s", v)
+						}
+						if strings.Contains(v, "+listMapKey") {
+							t.Errorf("Observation Rule comment must not contain +listMapKey: %s", v)
+						}
+					},
+					"ObservationInjectedKeyNoDefault": func(t *testing.T, comments map[string]string) {
+						t.Helper()
+						v := comments["example.RuleObservation:RuleIndex"]
+						if strings.Contains(v, "+kubebuilder:default") {
+							t.Errorf("Observation RuleIndex comment must not contain +kubebuilder:default: %s", v)
+						}
+					},
+				},
+			},
+		},
 	}
 	for n, tc := range cases {
 		t.Run(n, func(t *testing.T) {
+			if tc.args.setupFunc != nil {
+				tc.args.setupFunc(tc.args.cfg)
+			}
 			builder := NewBuilder(types.NewPackage("example", ""), tc.args.crdScope)
 			g, err := builder.Build(tc.cfg)
 
@@ -690,6 +896,117 @@ func TestBuild(t *testing.T) {
 			}
 			if diff := cmp.Diff(tc.want.validationRules, g.ValidationRules); diff != "" {
 				t.Fatalf("Build(...): -want validationRules, +got validationRules: %s", diff)
+			}
+			for checkName, checkFn := range tc.want.commentChecks {
+				t.Run(checkName, func(t *testing.T) {
+					checkFn(t, g.Comments)
+				})
+			}
+		})
+	}
+}
+
+func TestBuildFieldTypeOverride(t *testing.T) {
+	type want struct {
+		forProvider  string
+		initProvider string
+		observation  string
+		errContains  string
+	}
+	cases := map[string]struct {
+		reason string
+		cfg    func(t *testing.T) *config.Resource
+		want   want
+	}{
+		"ScalarOverrideAppliesToAllAPIs": {
+			reason: "Overriding a scalar field's type replaces it across forProvider, initProvider and observation.",
+			cfg: func(t *testing.T) *config.Resource {
+				r := config.DefaultResource("test_resource", &schema.Resource{
+					Schema: map[string]*schema.Schema{
+						"enabled": {
+							Type:     schema.TypeBool,
+							Optional: true,
+						},
+					},
+				}, nil, nil)
+				r.Kind = ""
+				if err := r.OverrideScalarFieldType("enabled", NewStringOrBoolType()); err != nil {
+					t.Fatalf("cannot override the type of the scalar field at path %q: %v", "enabled", err)
+				}
+				return r
+			},
+			want: want{
+				forProvider:  `type example.Parameters struct{Enabled *github.com/crossplane/upjet/v2/pkg/types.StringOrBool "json:\"enabled,omitempty\" tf:\"enabled,omitempty\""}`,
+				initProvider: `type example.InitParameters struct{Enabled *github.com/crossplane/upjet/v2/pkg/types.StringOrBool "json:\"enabled,omitempty\" tf:\"enabled,omitempty\""}`,
+				observation:  `type example.Observation struct{Enabled *github.com/crossplane/upjet/v2/pkg/types.StringOrBool "json:\"enabled,omitempty\" tf:\"enabled,omitempty\""}`,
+			},
+		},
+		"NonScalarOverrideErrors": {
+			reason: "Overriding a non-scalar (collection) field's type is a generation-time error.",
+			cfg: func(t *testing.T) *config.Resource {
+				sch := &schema.Resource{
+					Schema: map[string]*schema.Schema{
+						"settings": {
+							Type:     schema.TypeString,
+							Optional: true,
+						},
+					},
+				}
+				r := config.DefaultResource("test_resource", sch, nil, nil)
+				r.Kind = ""
+				if err := r.OverrideScalarFieldType("settings", NewStringOrBoolType()); err != nil {
+					t.Fatalf("cannot override the type of the field at path %q: %v", "settings", err)
+				}
+				// config.Resource.OverrideScalarFieldType rejects the
+				// non-scalar paths, so the field is turned into a collection
+				// only after the override has been configured to exercise the
+				// generation-time check. This could happen due to a schema traverser
+				// or due to other Terraform schema mutators.
+				sch.Schema["settings"] = &schema.Schema{
+					Type:     schema.TypeList,
+					Optional: true,
+					Elem: &schema.Resource{
+						Schema: map[string]*schema.Schema{
+							"size": {
+								Type:     schema.TypeInt,
+								Optional: true,
+							},
+						},
+					},
+				}
+				return r
+			},
+			want: want{
+				errContains: `field at path "settings" with Terraform type TypeList specified for OverrideScalarFieldType is not scalar, only scalar field types can be overridden`,
+			},
+		},
+	}
+	for n, tc := range cases {
+		t.Run(n, func(t *testing.T) {
+			builder := NewBuilder(types.NewPackage("example", ""), CRDScopeCluster)
+			g, err := builder.Build(tc.cfg(t))
+
+			if tc.want.errContains != "" {
+				if err == nil {
+					t.Fatalf("%s\nBuild(...): expected an error containing %q, got nil", tc.reason, tc.want.errContains)
+				}
+				if !strings.Contains(err.Error(), tc.want.errContains) {
+					t.Errorf("%s\nBuild(...): error %q does not contain %q", tc.reason, err.Error(), tc.want.errContains)
+				}
+				return
+			}
+
+			if err != nil {
+				t.Fatalf("%s\nBuild(...): unexpected error: %v", tc.reason, err)
+			}
+			if diff := cmp.Diff(tc.want.forProvider, g.ForProviderType.Obj().String()); diff != "" {
+				t.Errorf("%s\nBuild(...): -want forProvider, +got forProvider:\n%s", tc.reason, diff)
+			}
+			if diff := cmp.Diff(tc.want.initProvider, g.InitProviderType.Obj().String()); diff != "" {
+				t.Errorf("%s\nBuild(...): -want initProvider, +got initProvider:\n%s", tc.reason, diff)
+			}
+			if diff := cmp.Diff(tc.want.observation, g.AtProviderType.Obj().String()); diff != "" {
+				t.Errorf("%s\nBuild(...): -want observation, +got observation:\n%s", tc.reason, diff)
 			}
 		})
 	}

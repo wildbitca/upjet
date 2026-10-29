@@ -114,7 +114,7 @@ func (svu *storageVersionMarkerUpdater) updateVersionFile(group, version string,
 	}
 
 	// Write back to file
-	if err := os.WriteFile(filePath, []byte(updatedContent), 0600); err != nil {
+	if err := os.WriteFile(filePath, []byte(updatedContent), 0600); err != nil { //nolint:gosec // generation only
 		return errors.Wrapf(err, "cannot write file %s", filePath)
 	}
 

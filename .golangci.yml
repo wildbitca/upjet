@@ -21,7 +21,6 @@ linters:
     - exhaustive
     - gocheckcompilerdirectives
     - gochecksumtype
-    - goconst
     - gocritic
     - gocyclo
     - gosec
@@ -153,8 +152,20 @@ linters:
         text: 'SA1019:'
       - linters:
           - staticcheck
+        path: pkg/types/reference_test.go
+        text: "SA1019: .*Type is deprecated in favor of TerraformName.*"
+      - linters:
+          - staticcheck
         path: pkg/types/markers/crossplane.go
         text: 'SA1019:'
+      - linters:
+          - staticcheck
+        path: pkg/types/markers/crossplane_test.go
+        text: "SA1019: .*Type is deprecated in favor of TerraformName.*"
+      - linters:
+          - staticcheck
+        path: pkg/types/comments/comment_test.go
+        text: "SA1019: .*Type is deprecated in favor of TerraformName.*"
       - linters:
           - govet
         text: 'buildtag:'

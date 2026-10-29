@@ -12,10 +12,10 @@ import (
 	"strings"
 
 	"dario.cat/mergo"
-	xpv1 "github.com/crossplane/crossplane-runtime/v2/apis/common/v1"
 	"github.com/crossplane/crossplane-runtime/v2/pkg/feature"
 	"github.com/crossplane/crossplane-runtime/v2/pkg/meta"
 	xpresource "github.com/crossplane/crossplane-runtime/v2/pkg/resource"
+	xpv2 "github.com/crossplane/crossplane/apis/v2/core/v2"
 	"github.com/pkg/errors"
 	"github.com/spf13/afero"
 
@@ -110,20 +110,26 @@ func NewFileProducer(ctx context.Context, client resource.SecretClient, dir stri
 		}
 	}
 
-	if err = resource.GetSensitiveParameters(ctx, client, tr, params, tr.GetConnectionDetailsMapping()); err != nil {
-		return nil, errors.Wrap(err, "cannot get sensitive parameters")
-	}
-	fp.Config.ExternalName.SetIdentifierArgumentFn(params, meta.GetExternalName(tr))
-	// apply dynamic-pseudo type conversions to params here
+	// Apply Terraform conversions.
 	params, err = cfg.ApplyTFConversions(params, config.ToTerraform)
 	if err != nil {
 		return nil, errors.Wrap(err, "cannot apply terraform parameter conversions")
 	}
+	if err = resource.GetSensitiveParameters(ctx, client, tr, params, tr.GetConnectionDetailsMapping()); err != nil {
+		return nil, errors.Wrap(err, "cannot get sensitive parameters")
+	}
+	fp.Config.ExternalName.SetIdentifierArgumentFn(params, meta.GetExternalName(tr))
 	fp.parameters = params
 
 	obs, err := tr.GetObservation()
 	if err != nil {
 		return nil, errors.Wrap(err, "cannot get observation")
+	}
+
+	// Apply Terraform conversions.
+	obs, err = cfg.ApplyTFConversions(obs, config.ToTerraform)
+	if err != nil {
+		return nil, errors.Wrap(err, "cannot apply terraform conversions on MR state")
 	}
 
 	secretRef, err := getConnectionSecretRef(tr)
@@ -138,7 +144,7 @@ func NewFileProducer(ctx context.Context, client resource.SecretClient, dir stri
 	return fp, nil
 }
 
-func getConnectionSecretRef(tr resource.Terraformed) (*xpv1.SecretReference, error) {
+func getConnectionSecretRef(tr resource.Terraformed) (*xpv2.SecretReference, error) {
 	switch trt := tr.(type) {
 	case xpresource.ConnectionSecretWriterTo:
 		return trt.GetWriteConnectionSecretToReference(), nil
@@ -146,7 +152,7 @@ func getConnectionSecretRef(tr resource.Terraformed) (*xpv1.SecretReference, err
 		if trt.GetWriteConnectionSecretToReference() == nil {
 			return nil, nil
 		}
-		return &xpv1.SecretReference{
+		return &xpv2.SecretReference{
 			Name:      trt.GetWriteConnectionSecretToReference().Name,
 			Namespace: tr.GetNamespace(),
 		}, nil
@@ -171,7 +177,7 @@ type FileProducer struct {
 }
 
 // BuildMainTF produces the contents of the mainTF file as a map.  This format is conducive to
-// inspection for tests.  WriteMainTF calls this function an serializes the result to a file as JSON.
+// inspection for tests.  WriteMainTF calls this function and serializes the result to a file as JSON.
 func (fp *FileProducer) BuildMainTF() map[string]any {
 	// If the resource is in a deletion process, we need to remove the deletion
 	// protection.
