@@ -511,7 +511,7 @@ func (pm *ProviderMetadata) ScrapeRepo(config *ScrapeConfiguration) error {
 		r := &Resource{}
 		// don't scrape if file is empty
 		filename := filepath.Clean(path)
-		b, err := os.ReadFile(filename)
+		b, err := os.ReadFile(filename) //nolint:gosec // generation only
 		if err != nil {
 			return errors.Wrap(err, "failed to read markdown file")
 		}

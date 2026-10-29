@@ -7,8 +7,8 @@ package controller
 import (
 	"context"
 
-	xpv1 "github.com/crossplane/crossplane-runtime/v2/apis/common/v1"
 	xpresource "github.com/crossplane/crossplane-runtime/v2/pkg/resource"
+	xpv2 "github.com/crossplane/crossplane/apis/v2/core/v2"
 	"github.com/pkg/errors"
 	v1 "k8s.io/api/core/v1"
 	"k8s.io/apimachinery/pkg/runtime/schema"
@@ -38,6 +38,14 @@ const (
 	rateLimiterCallback = "asyncCallback"
 )
 
+type asyncOperation string
+
+const (
+	opCreate  asyncOperation = "create"
+	opUpdate  asyncOperation = "update"
+	opDestroy asyncOperation = "destroy"
+)
+
 var _ CallbackProvider = &APICallbacks{}
 
 // APISecretClient is a client for getting k8s secrets
@@ -46,7 +54,7 @@ type APISecretClient struct {
 }
 
 // GetSecretData gets and returns data for the referenced secret
-func (a *APISecretClient) GetSecretData(ctx context.Context, ref *xpv1.SecretReference) (map[string][]byte, error) {
+func (a *APISecretClient) GetSecretData(ctx context.Context, ref *xpv2.SecretReference) (map[string][]byte, error) {
 	secret := &v1.Secret{}
 	if err := a.kube.Get(ctx, types.NamespacedName{Namespace: ref.Namespace, Name: ref.Name}, secret); err != nil {
 		return nil, err
@@ -55,7 +63,7 @@ func (a *APISecretClient) GetSecretData(ctx context.Context, ref *xpv1.SecretRef
 }
 
 // GetSecretValue gets and returns value for key of the referenced secret
-func (a *APISecretClient) GetSecretValue(ctx context.Context, sel xpv1.SecretKeySelector) ([]byte, error) {
+func (a *APISecretClient) GetSecretValue(ctx context.Context, sel xpv2.SecretKeySelector) ([]byte, error) {
 	d, err := a.GetSecretData(ctx, &sel.SecretReference)
 	if err != nil {
 		return nil, errors.Wrap(err, "cannot get secret data")
@@ -113,7 +121,7 @@ type APICallbacks struct {
 	enableStatusUpdates bool
 }
 
-func (ac *APICallbacks) callbackFn(nn types.NamespacedName, op string) terraform.CallbackFn {
+func (ac *APICallbacks) callbackFn(nn types.NamespacedName, op asyncOperation, requestReconcile bool) terraform.CallbackFn { //nolint:gocyclo // for better readability
 	return func(err error, ctx context.Context) error {
 		tr := ac.newTerraformed()
 		if kErr := ac.kube.Get(ctx, nn, tr); kErr != nil {
@@ -128,22 +136,22 @@ func (ac *APICallbacks) callbackFn(nn types.NamespacedName, op string) terraform
 		if err != nil {
 			wrapMsg := ""
 			switch op {
-			case "create":
+			case opCreate:
 				wrapMsg = errXPReconcileCreate
-			case "update":
+			case opUpdate:
 				wrapMsg = errXPReconcileUpdate
-			case "destroy":
+			case opDestroy:
 				wrapMsg = errXPReconcileDelete
 			}
-			tr.SetConditions(xpv1.ReconcileError(errors.Wrap(err, wrapMsg)))
+			tr.SetConditions(xpv2.ReconcileError(errors.Wrap(err, wrapMsg)))
 		} else {
-			tr.SetConditions(xpv1.ReconcileSuccess())
+			tr.SetConditions(xpv2.ReconcileSuccess())
 		}
 		if ac.enableStatusUpdates {
 			tr.SetConditions(resource.AsyncOperationFinishedCondition())
 		}
 		uErr := errors.Wrapf(ac.kube.Status().Update(ctx, tr), errUpdateStatusFmt, tr.GetObjectKind().GroupVersionKind().String(), nn, op)
-		if ac.eventHandler != nil {
+		if ac.eventHandler != nil && requestReconcile {
 			rateLimiter := handler.NoRateLimiter
 			switch {
 			case err != nil:
@@ -162,7 +170,7 @@ func (ac *APICallbacks) callbackFn(nn types.NamespacedName, op string) terraform
 }
 
 // Create makes sure the error is saved in async operation condition.
-func (ac *APICallbacks) Create(name types.NamespacedName) terraform.CallbackFn {
+func (ac *APICallbacks) Create(name types.NamespacedName, requestReconcile bool) terraform.CallbackFn {
 	// request will be requeued although the managed reconciler already
 	// requeues with exponential back-off during the creation phase
 	// because the upjet external client returns ResourceExists &
@@ -170,19 +178,19 @@ func (ac *APICallbacks) Create(name types.NamespacedName) terraform.CallbackFn {
 	// in-progress immediately following a Create call. This will
 	// delay a reobservation of the resource (while being created)
 	// for the poll period.
-	return ac.callbackFn(name, "create")
+	return ac.callbackFn(name, opCreate, requestReconcile)
 }
 
 // Update makes sure the error is saved in async operation condition.
-func (ac *APICallbacks) Update(name types.NamespacedName) terraform.CallbackFn {
-	return ac.callbackFn(name, "update")
+func (ac *APICallbacks) Update(name types.NamespacedName, requestReconcile bool) terraform.CallbackFn {
+	return ac.callbackFn(name, opUpdate, requestReconcile)
 }
 
 // Destroy makes sure the error is saved in async operation condition.
-func (ac *APICallbacks) Destroy(name types.NamespacedName) terraform.CallbackFn {
+func (ac *APICallbacks) Destroy(name types.NamespacedName, requestReconcile bool) terraform.CallbackFn {
 	// request will be requeued although the managed reconciler requeues
 	// with exponential back-off during the deletion phase because
 	// during the async deletion operation, external client's
 	// observe just returns success to the managed reconciler.
-	return ac.callbackFn(name, "destroy")
+	return ac.callbackFn(name, opDestroy, requestReconcile)
 }

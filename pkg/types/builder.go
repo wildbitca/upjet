@@ -10,9 +10,9 @@ import (
 	"go/types"
 	"sort"
 
+	"github.com/crossplane/crossplane-runtime/v2/pkg/errors"
 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/schema"
 	twtypes "github.com/muvaf/typewriter/pkg/types"
-	"github.com/pkg/errors"
 	"k8s.io/utils/ptr"
 
 	"github.com/crossplane/upjet/v2/pkg/config"
@@ -120,10 +120,14 @@ func injectServerSideApplyListMergeKeys(cfg *config.Resource) error { //nolint:g
 				return errors.Errorf("element schema for the object list %q already contains the argument key %q", f, k)
 			}
 		}
+		desc := descriptionInjectedKey
+		if s.ListMergeStrategy.ListMapKeys.InjectedKey.Description != "" {
+			desc = s.ListMergeStrategy.ListMapKeys.InjectedKey.Description
+		}
 		el.Schema[s.ListMergeStrategy.ListMapKeys.InjectedKey.Key] = &schema.Schema{
 			Type:        schema.TypeString,
 			Required:    true,
-			Description: descriptionInjectedKey,
+			Description: desc,
 		}
 		if s.ListMergeStrategy.ListMapKeys.InjectedKey.DefaultValue != "" {
 			el.Schema[s.ListMergeStrategy.ListMapKeys.InjectedKey.Key].Default = s.ListMergeStrategy.ListMapKeys.InjectedKey.DefaultValue
@@ -215,6 +219,17 @@ func (g *Builder) AddToBuilder(typeNames *TypeNames, r *resource) (*types.Named,
 }
 
 func (g *Builder) buildSchema(f *Field, cfg *config.Resource, names []string, cpath string, r *resource) (types.Type, types.Type, error) { //nolint:gocyclo
+	if o := cfg.FieldTypeOverride(cpath); o.ParameterTypeOverride != nil {
+		switch f.Schema.Type { //nolint:exhaustive // The default case handles the error cases (non-scalar paths) already.
+		case schema.TypeBool, schema.TypeFloat, schema.TypeInt, schema.TypeString:
+			return o.ParameterTypeOverride, nil, nil
+		default:
+			return nil, nil, errors.Errorf(
+				"field at path %q with Terraform type %s specified for OverrideScalarFieldType is not scalar, only scalar field types can be overridden",
+				cpath, f.Schema.Type.String())
+		}
+	}
+
 	switch f.Schema.Type {
 	case schema.TypeBool:
 		return types.NewPointer(types.Universe.Lookup("bool").Type()), nil, nil

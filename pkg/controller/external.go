@@ -8,10 +8,10 @@ import (
 	"context"
 	"time"
 
-	xpv1 "github.com/crossplane/crossplane-runtime/v2/apis/common/v1"
 	"github.com/crossplane/crossplane-runtime/v2/pkg/logging"
 	"github.com/crossplane/crossplane-runtime/v2/pkg/reconciler/managed"
 	xpresource "github.com/crossplane/crossplane-runtime/v2/pkg/resource"
+	xpv2 "github.com/crossplane/crossplane/apis/v2/core/v2"
 	"github.com/pkg/errors"
 	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/apimachinery/pkg/util/sets"
@@ -200,7 +200,7 @@ func (e *external) Observe(ctx context.Context, mg xpresource.Managed) (managed.
 		return managed.ExternalObservation{}, errors.New(errUnexpectedObject)
 	}
 
-	policySet := sets.New[xpv1.ManagementAction](tr.GetManagementPolicies()...)
+	policySet := sets.New[xpv2.ManagementAction](tr.GetManagementPolicies()...)
 
 	// Note(turkenh): We don't need to check if the management policies are
 	// enabled or not because the crossplane-runtime's managed reconciler already
@@ -211,7 +211,7 @@ func (e *external) Observe(ctx context.Context, mg xpresource.Managed) (managed.
 	// Note (lsviben) We are only using import instead of refresh if the
 	// management policies do not contain create or update as they need the
 	// required fields to be set, which is not the case for import.
-	if !policySet.HasAny(xpv1.ManagementActionCreate, xpv1.ManagementActionUpdate, xpv1.ManagementActionAll) {
+	if !policySet.HasAny(xpv2.ManagementActionCreate, xpv2.ManagementActionUpdate, xpv2.ManagementActionAll) {
 		return e.Import(ctx, tr)
 	}
 
@@ -248,9 +248,6 @@ func (e *external) Observe(ctx context.Context, mg xpresource.Managed) (managed.
 	if err := resource.NormalizeStateID(tfstate); err != nil {
 		return managed.ExternalObservation{}, errors.Wrap(err, "cannot normalize state id")
 	}
-	if err := tr.SetObservation(tfstate); err != nil {
-		return managed.ExternalObservation{}, errors.Wrap(err, "cannot set observation")
-	}
 
 	// NOTE(lsviben) although the annotations were supposed to be set and the
 	// managed resource updated during the Create step, we are checking and
@@ -267,7 +264,7 @@ func (e *external) Observe(ctx context.Context, mg xpresource.Managed) (managed.
 	if err != nil {
 		return managed.ExternalObservation{}, errors.Wrap(err, "cannot set critical annotations")
 	}
-	policyHasLateInit := policySet.HasAny(xpv1.ManagementActionLateInitialize, xpv1.ManagementActionAll)
+	policyHasLateInit := policySet.HasAny(xpv2.ManagementActionLateInitialize, xpv2.ManagementActionAll)
 	if annotationsUpdated && !policyHasLateInit {
 		if err := e.kube.Update(ctx, mg); err != nil {
 			return managed.ExternalObservation{}, errors.Wrap(err, errUpdateAnnotations)
@@ -279,14 +276,28 @@ func (e *external) Observe(ctx context.Context, mg xpresource.Managed) (managed.
 		return managed.ExternalObservation{}, errors.Wrap(err, "cannot get connection details")
 	}
 
+	// Apply Terraform conversions.
+	tfstate, err = e.config.ApplyTFConversions(tfstate, config.FromTerraform)
+	if err != nil {
+		return managed.ExternalObservation{}, errors.Wrap(err, "cannot apply terraform conversions")
+	}
+	// Set the MR state using any Terraform runtime conversions applied.
+	if err := tr.SetObservation(tfstate); err != nil {
+		return managed.ExternalObservation{}, errors.Wrap(err, "cannot set observation")
+	}
+
 	var lateInitedParams bool
 	if policyHasLateInit {
-		lateInitedParams, err = tr.LateInitialize(res.State.GetAttributes())
+		buff, err := json.JSParser.Marshal(tfstate)
+		if err != nil {
+			return managed.ExternalObservation{}, errors.Wrap(err, "cannot marshal state attributes")
+		}
+		lateInitedParams, err = tr.LateInitialize(buff)
 		if err != nil {
 			return managed.ExternalObservation{}, errors.Wrap(err, "cannot late initialize parameters")
 		}
 	}
-	markedAvailable := tr.GetCondition(xpv1.TypeReady).Equal(xpv1.Available())
+	markedAvailable := tr.GetCondition(xpv2.TypeReady).Equal(xpv2.Available())
 
 	// In the following switch block, before running a relatively costly
 	// Terraform apply and that may fail before critical annotations are
@@ -313,7 +324,7 @@ func (e *external) Observe(ctx context.Context, mg xpresource.Managed) (managed.
 	// we prioritize status updates over late-init'ed spec updates
 	case !markedAvailable:
 		addTTR(tr)
-		tr.SetConditions(xpv1.Available())
+		tr.SetConditions(xpv2.Available())
 		e.logger.Debug("Resource is marked as available.")
 		if e.eventHandler != nil {
 			name := types.NamespacedName{
@@ -385,7 +396,8 @@ func (e *external) Create(ctx context.Context, mg xpresource.Managed) (managed.E
 	}
 	defer e.stopProvider()
 	if e.config.UseAsync {
-		return managed.ExternalCreation{}, errors.Wrap(e.workspace.ApplyAsync(e.callback.Create(name)), errStartAsyncApply)
+		// TODO: check whether we need a requeue or not.
+		return managed.ExternalCreation{}, errors.Wrap(e.workspace.ApplyAsync(e.callback.Create(name, true)), errStartAsyncApply)
 	}
 	tr, ok := mg.(resource.Terraformed)
 	if !ok {
@@ -424,7 +436,8 @@ func (e *external) Update(ctx context.Context, mg xpresource.Managed) (managed.E
 	}
 	defer e.stopProvider()
 	if e.config.UseAsync {
-		return managed.ExternalUpdate{}, errors.Wrap(e.workspace.ApplyAsync(e.callback.Update(name)), errStartAsyncApply)
+		// TODO: check whether we need a requeue or not.
+		return managed.ExternalUpdate{}, errors.Wrap(e.workspace.ApplyAsync(e.callback.Update(name, true)), errStartAsyncApply)
 	}
 	tr, ok := mg.(resource.Terraformed)
 	if !ok {
@@ -434,11 +447,16 @@ func (e *external) Update(ctx context.Context, mg xpresource.Managed) (managed.E
 	if err != nil {
 		return managed.ExternalUpdate{}, errors.Wrap(err, errApply)
 	}
-	attr := map[string]any{}
-	if err := json.JSParser.Unmarshal(res.State.GetAttributes(), &attr); err != nil {
+	tfstate := map[string]any{}
+	if err := json.JSParser.Unmarshal(res.State.GetAttributes(), &tfstate); err != nil {
 		return managed.ExternalUpdate{}, errors.Wrap(err, "cannot unmarshal state attributes")
 	}
-	return managed.ExternalUpdate{}, errors.Wrap(tr.SetObservation(attr), "cannot set observation")
+	// Apply Terraform conversions.
+	tfstate, err = e.config.ApplyTFConversions(tfstate, config.FromTerraform)
+	if err != nil {
+		return managed.ExternalUpdate{}, errors.Wrap(err, "cannot apply terraform conversions")
+	}
+	return managed.ExternalUpdate{}, errors.Wrap(tr.SetObservation(tfstate), "cannot set observation")
 }
 
 func (e *external) Delete(ctx context.Context, mg xpresource.Managed) (managed.ExternalDelete, error) {
@@ -455,7 +473,8 @@ func (e *external) Delete(ctx context.Context, mg xpresource.Managed) (managed.E
 	}
 	defer e.stopProvider()
 	if e.config.UseAsync {
-		return managed.ExternalDelete{}, errors.Wrap(e.workspace.DestroyAsync(e.callback.Destroy(name)), errStartAsyncDestroy)
+		// TODO: check whether we need a requeue or not.
+		return managed.ExternalDelete{}, errors.Wrap(e.workspace.DestroyAsync(e.callback.Destroy(name, true)), errStartAsyncDestroy)
 	}
 	return managed.ExternalDelete{}, errors.Wrap(e.workspace.Destroy(ctx), errDestroy)
 }
@@ -500,15 +519,22 @@ func (e *external) Import(ctx context.Context, tr resource.Terraformed) (managed
 	if err := resource.NormalizeStateID(tfstate); err != nil {
 		return managed.ExternalObservation{}, errors.Wrap(err, "cannot normalize state id")
 	}
-	if err := tr.SetObservation(tfstate); err != nil {
-		return managed.ExternalObservation{}, errors.Wrap(err, "cannot set observation")
-	}
 	conn, err := resource.GetConnectionDetails(tfstate, tr, e.config)
 	if err != nil {
 		return managed.ExternalObservation{}, errors.Wrap(err, "cannot get connection details")
 	}
 
-	tr.SetConditions(xpv1.Available())
+	// Apply Terraform conversions.
+	tfstate, err = e.config.ApplyTFConversions(tfstate, config.FromTerraform)
+	if err != nil {
+		return managed.ExternalObservation{}, errors.Wrap(err, "cannot apply terraform conversions when importing")
+	}
+	// Set the MR state using any Terraform runtime conversions applied.
+	if err := tr.SetObservation(tfstate); err != nil {
+		return managed.ExternalObservation{}, errors.Wrap(err, "cannot set observation when importing")
+	}
+
+	tr.SetConditions(xpv2.Available())
 	return managed.ExternalObservation{
 		ResourceExists:    true,
 		ResourceUpToDate:  true,

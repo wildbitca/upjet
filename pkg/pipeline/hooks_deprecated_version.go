@@ -113,7 +113,7 @@ func (mu *lifecycleMarkerUpdater) updateVersionFile(group, version string, resou
 	}
 
 	// Write back to file
-	if err := os.WriteFile(filePath, []byte(updatedContent), 0600); err != nil {
+	if err := os.WriteFile(filePath, []byte(updatedContent), 0600); err != nil { //nolint:gosec // generation only
 		return errors.Wrapf(err, "cannot write file %s", filePath)
 	}
 

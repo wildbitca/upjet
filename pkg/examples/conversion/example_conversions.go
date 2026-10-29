@@ -48,7 +48,7 @@ func ApplyAPIConverters(pc *config.Provider, startPath, licenseHeaderPath string
 		var convertedFileContent string
 		if !info.IsDir() && strings.HasSuffix(info.Name(), ".yaml") {
 			log.Printf("Converting: %s\n", path)
-			content, err := os.ReadFile(filepath.Clean(path))
+			content, err := os.ReadFile(filepath.Clean(path)) //nolint:gosec // generation only
 			if err != nil {
 				return errors.Wrapf(err, "failed to read the %s file", path)
 			}

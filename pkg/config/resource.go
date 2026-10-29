@@ -7,22 +7,23 @@ package config
 import (
 	"context"
 	"fmt"
+	"go/types"
 	"math"
 	"strconv"
 	"strings"
 	"time"
 
-	xpv1 "github.com/crossplane/crossplane-runtime/v2/apis/common/v1"
+	"github.com/crossplane/crossplane-runtime/v2/pkg/errors"
 	"github.com/crossplane/crossplane-runtime/v2/pkg/fieldpath"
 	"github.com/crossplane/crossplane-runtime/v2/pkg/reconciler/managed"
 	xpresource "github.com/crossplane/crossplane-runtime/v2/pkg/resource"
+	xpv2 "github.com/crossplane/crossplane/apis/v2/core/v2"
 	fwresource "github.com/hashicorp/terraform-plugin-framework/resource"
 	rschema "github.com/hashicorp/terraform-plugin-framework/resource/schema"
 	"github.com/hashicorp/terraform-plugin-go/tfprotov6"
 	"github.com/hashicorp/terraform-plugin-go/tftypes"
 	"github.com/hashicorp/terraform-plugin-sdk/v2/helper/schema"
 	"github.com/hashicorp/terraform-plugin-sdk/v2/terraform"
-	"github.com/pkg/errors"
 	"k8s.io/apimachinery/pkg/util/json"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/utils/ptr"
@@ -170,13 +171,10 @@ type ExternalName struct {
 	// from terraformProviderConfig, and others from parameters map if needed.
 	GetIDFn GetIDFn
 
-	// GetImportIDFn, when set, returns the string passed to `terraform import`
-	// for this resource. It is optional: when nil, the output of GetIDFn is
-	// used for both the synthetic state "id" and the import ID. Set it only for
-	// resources whose importer expects a different format than the "id" the
-	// provider stores in state (for example a composite "org/slug" import ID
-	// while the state id is the bare slug). It takes the same arguments as
-	// GetIDFn.
+	// GetImportIDFn optionally returns the ID to pass to "terraform import".
+	// Some providers use a different ID format for import than for the state
+	// "id" field (e.g. plain text vs base64-encoded compound keys). When nil,
+	// GetIDFn is used for both import and state (preserving existing behavior).
 	GetImportIDFn GetIDFn
 
 	// OmittedFields are the ones you'd like to be removed from the schema since
@@ -373,7 +371,7 @@ func NewTagger(kube client.Client, fieldName string) *Tagger {
 
 // Initialize is a custom initializer for setting external tags
 func (t *Tagger) Initialize(ctx context.Context, mg xpresource.Managed) error {
-	if sets.New[xpv1.ManagementAction](mg.GetManagementPolicies()...).Equal(sets.New[xpv1.ManagementAction](xpv1.ManagementActionObserve)) {
+	if sets.New[xpv2.ManagementAction](mg.GetManagementPolicies()...).Equal(sets.New[xpv2.ManagementAction](xpv2.ManagementActionObserve)) {
 		// We don't want to add tags to the spec.forProvider if the resource is
 		// only being Observed.
 		return nil
@@ -415,6 +413,9 @@ func setExternalTagsWithPaved(externalTags map[string]string, paved *fieldpath.P
 type InjectedKey struct {
 	Key          string
 	DefaultValue string
+	// Description is the OpenAPI schema description for the injected list-map key field.
+	// If empty, defaults to a standard description about server-side apply merge behavior.
+	Description string
 }
 
 // ListMapKeys is the list map keys when the server-side apply merge strategy
@@ -729,6 +730,11 @@ type Resource struct {
 	// the Terraform Plugin SDKv2 client.
 	useTerraformPluginFrameworkClient bool
 
+	// overrideGeneratedFieldType allows to manually override the type for the
+	// generated field of a Resource at the specified Terraform path.
+	// We only support type overrides for scalar fields currently.
+	overrideGeneratedFieldType map[string]types.Type
+
 	// OverrideFieldNames allows to manually override the relevant field name to
 	// avoid possible Go struct name conflicts that may occur after Multiversion
 	// CRDs support. During field generation, there may be fields with the same
@@ -768,6 +774,77 @@ type Resource struct {
 	// silently modify resource data without notifying the management layer
 	// (e.g., sanitized XML fields).
 	UpdateLoopPrevention UpdateLoopPrevention
+
+	// AutoConversionRegistrationOptions controls the automatic registration of
+	// API version conversion functions based on detected CRD schema changes.
+	// See RegisterAutoConversions and ExcludeTypeChangesFromIdentity
+	// for details on how these options are used.
+	AutoConversionRegistrationOptions AutoConversionRegistrationOptions
+}
+
+// AutoConversionRegistrationOptions configures how automatic conversion function registration
+// behaves for a specific resource. This allows fine-grained control over the automatic
+// conversion system that detects breaking changes and registers appropriate conversions.
+//
+// The automatic conversion system (see pkg/config/conversion.go) processes CRD schema changes
+// and registers conversion functions for:
+// - Field additions/deletions (using annotation-based persistence)
+// - Type changes (string↔number, string↔boolean)
+//
+// This struct provides three control mechanisms:
+// 1. Complete opt-out via SkipAutoRegistration
+// 2. Exclusion of specific paths from auto-registration
+// 3. Tracking of paths excluded from identity conversion (populated automatically)
+//
+// Note: IdentityConversionExcludePaths is automatically populated by
+// ExcludeTypeChangesFromIdentity and should not be manually set.
+type AutoConversionRegistrationOptions struct {
+	// SkipAutoRegistration completely disables automatic conversion registration for this resource.
+	// When true, the resource will be skipped by RegisterAutoConversions.
+	//
+	// Use this when:
+	//   - The resource has complex custom conversions that cannot be auto-generated
+	//   - You want full manual control over all conversions for this resource
+	//   - The automatic system produces incorrect conversions for this resource
+	//
+	// Default: false (auto-registration enabled)
+	SkipAutoRegistration bool
+
+	// IdentityConversionExcludePaths contains field paths that should be excluded from
+	// identity conversion because their types changed between API versions.
+	//
+	// This field is AUTOMATICALLY POPULATED by ExcludeTypeChangesFromIdentity
+	// and should not be manually set by resource configurations. It is used by:
+	//   - Identity converters to skip type-changed fields during copying
+	//   - Singleton list converters to avoid incompatible type conversions
+	//
+	// The paths in this slice use Terraform schema format (without spec.forProvider prefix).
+	// Example: ["instanceType", "tags[*].value"]
+	//
+	// Technical note: Type-changed fields must be excluded from identity conversion
+	// because direct field copying would fail when types don't match (e.g., copying
+	// a string value into a number field). These fields are instead handled by
+	// specialized type conversion functions.
+	IdentityConversionExcludePaths []string
+
+	// AutoRegisterExcludePaths specifies field paths that should be excluded from
+	// automatic conversion registration, even if changes are detected.
+	//
+	// Use this to override automatic registration for specific fields when:
+	//   - The automatic conversion is incorrect (e.g., wrong int vs float guess)
+	//   - You need custom conversion logic for specific fields
+	//   - You want to manually register conversions with special handling
+	//
+	// Paths must use the full CRD format including prefixes.
+	// Example: []string{"spec.forProvider.configuration", "status.atProvider.metadata"}
+	//
+	// After excluding a path, you can manually register conversions:
+	//   r.AutoConversionRegistrationOptions.AutoRegisterExcludePaths = []string{"spec.forProvider.price"}
+	//   r.Conversions = append(r.Conversions,
+	//       conversion.NewFieldTypeConversion("v1beta1", "v1beta2", "spec.forProvider.price", conversion.StringToFloat),
+	//       conversion.NewFieldTypeConversion("v1beta2", "v1beta1", "spec.forProvider.price", conversion.FloatToString),
+	//   )
+	AutoRegisterExcludePaths []string
 }
 
 // UpdateLoopPrevention is an interface that defines the behavior to prevent
@@ -1129,6 +1206,46 @@ func (r *Resource) RemoveSingletonListConversion(tfPath string) bool {
 		}
 	}
 	return false
+}
+
+// OverrideScalarFieldType allows to manually override the type for the
+// generated scalar field of a Resource at the specified Terraform path.
+// The path is a Terraform field path without the wildcard segments, e.g.,
+// "x.y", even if "x" is a collection type.
+// We only support overriding types for scalar fields as of now.
+// Trying to override the type generated for a non-scalar path will result in
+// an error.
+func (r *Resource) OverrideScalarFieldType(path string, t types.Type) error {
+	if r.TerraformResource == nil {
+		return errors.Errorf("resource %q does not have a valid Terraform resource schema", r.Name)
+	}
+	s := GetSchema(r.TerraformResource, path)
+	if s == nil {
+		return errors.Errorf("path %s is not valid for the Terraform resource schema of %q", path, r.Name)
+	}
+	switch s.Type { //nolint:exhaustive // The default case handles the error cases (non-scalar paths) already.
+	case schema.TypeBool, schema.TypeFloat, schema.TypeInt, schema.TypeString:
+		r.overrideGeneratedFieldType[path] = t
+	default:
+		return errors.Errorf("field at path %q with Terraform type %s is not scalar, only scalar field types can be overridden", path, s.Type.String())
+	}
+	return nil
+}
+
+// FieldTypeOverrideConfiguration represents a configuration for a set of type
+// overrides at a specific Terraform path.
+type FieldTypeOverrideConfiguration struct {
+	ParameterTypeOverride types.Type
+}
+
+// FieldTypeOverride returns the type override configuration for the specified
+// path. The path is a Terraform field path without the wildcard segments,
+// e.g., "x.y", even if "x" is a collection type.
+// Note: This accessor is meant to be only used by the code generator.
+func (r *Resource) FieldTypeOverride(path string) FieldTypeOverrideConfiguration {
+	return FieldTypeOverrideConfiguration{
+		ParameterTypeOverride: r.overrideGeneratedFieldType[path],
+	}
 }
 
 // SetEmbeddedObject sets the EmbeddedObject for the specified key.

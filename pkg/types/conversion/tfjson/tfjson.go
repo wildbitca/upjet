@@ -147,6 +147,10 @@ func tfJSONBlockTypeToV2Schema(nb *tfjson.SchemaBlockType) *schemav2.Schema { //
 	// https://github.com/hashicorp/terraform-plugin-sdk/blob/6461ac6e9044a44157c4e2c8aec0f1ab7efc2055/helper/schema/core_schema.go#L204
 	v2sch.Computed = false
 	v2sch.Optional = false
+	if nb.MinItems > 0 {
+		v2sch.Required = true
+		v2sch.Optional = false
+	}
 	if nb.MinItems == 0 {
 		v2sch.Optional = true
 	}
@@ -154,24 +158,29 @@ func tfJSONBlockTypeToV2Schema(nb *tfjson.SchemaBlockType) *schemav2.Schema { //
 		v2sch.Computed = true
 	}
 
-	switch nb.NestingMode { //nolint:exhaustive
+	switch nb.NestingMode {
 	case tfjson.SchemaNestingModeSet:
 		v2sch.Type = schemav2.TypeSet
 	case tfjson.SchemaNestingModeList:
 		v2sch.Type = schemav2.TypeList
 	case tfjson.SchemaNestingModeMap:
 		v2sch.Type = schemav2.TypeMap
-	case tfjson.SchemaNestingModeSingle:
-		v2sch.Type = schemav2.TypeList
-		v2sch.MinItems = 0
-		// TODO(erhan): not sure whether we need this
-		// the block itself can be optional, even if some child attribute
-		// or block is required
-		v2sch.Required = hasRequiredChild(nb)
-		v2sch.Optional = !v2sch.Required
-		if v2sch.Required {
-			v2sch.MinItems = 1
-		}
+	case tfjson.SchemaNestingModeSingle, tfjson.SchemaNestingModeGroup:
+		// This is a Plugin Framework-only nesting mode, and
+		// FW schemas never get Min/MaxItems specified in their
+		// core schemas (tfjson schema).
+		// See https://github.com/hashicorp/terraform-plugin-framework/blob/a0219204842978493e5f7742b0c06d5c39951e73/internal/fwschema/block.go#L24
+		// Therefore, the heuristics for determining Required/Optional/Computed
+		// does not make sense and inconclusive. Always make them optional,
+		// so that they generate a configurable spec field in the CRD.
+		// This only affects the CRD generation. Runtime schema validations
+		// are still valid and relevant.
+		// Provider developers can manually override these in their provider,
+		// if they want observation-only, or make them Required.
+		v2sch.Type = SchemaTypeObject
+		v2sch.Required = false
+		v2sch.Optional = true
+		v2sch.Computed = false
 		v2sch.MaxItems = 1
 	default:
 		panic("unhandled nesting mode: " + nb.NestingMode)
