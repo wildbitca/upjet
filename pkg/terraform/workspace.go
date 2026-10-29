@@ -141,6 +141,9 @@ type Workspace struct {
 	filterFn func(string) string
 
 	terraformID string
+	// importID is the ID passed to `terraform import`. It equals terraformID
+	// unless the resource configures ExternalName.GetImportIDFn.
+	importID string
 }
 
 // UseProvider shares a native provider with the receiver Workspace.
@@ -359,7 +362,7 @@ func (w *Workspace) Import(ctx context.Context, tr resource.Terraformed) (Import
 	// This can differ from the resource schema ID format for some resources.
 	// Some TF Plugin Framework-based resources might not have the `id` attribute
 	// in their schema, though they can have import IDs.
-	if len(w.terraformID) == 0 {
+	if len(w.importID) == 0 {
 		return ImportResult{
 			Exists: false,
 		}, nil
@@ -371,7 +374,7 @@ func (w *Workspace) Import(ctx context.Context, tr resource.Terraformed) (Import
 		return ImportResult{}, errors.Wrap(err, "cannot remove terraform.tfstate file")
 	}
 
-	out, err := w.runTF(ctx, ModeSync, "import", "-input=false", "-lock=false", fmt.Sprintf("%s.%s", tr.GetTerraformResourceType(), tr.GetName()), w.terraformID)
+	out, err := w.runTF(ctx, ModeSync, "import", "-input=false", "-lock=false", fmt.Sprintf("%s.%s", tr.GetTerraformResourceType(), tr.GetName()), w.importID)
 	w.logger.Debug("import ended", "out", w.filterFn(string(out)))
 	if err != nil {
 		// Note(turkenh): This is not a great way to check if the resource does not exist, but it is the only
